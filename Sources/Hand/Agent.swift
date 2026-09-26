@@ -6,7 +6,6 @@ import AppKit
 final class Agent {
     let jev: JevClient
     let apps: [InstalledApp]
-    let pointer: Pointer
     let onStep: (String) -> Void
     /// Screen read taken when the talk key went down.
     let prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)?
@@ -17,12 +16,11 @@ final class Agent {
     let minConfidence = 0.25
     let doneThreshold = 0.6
 
-    init(jev: JevClient, apps: [InstalledApp], pointer: Pointer,
+    init(jev: JevClient, apps: [InstalledApp],
          prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)? = nil,
          onStep: @escaping (String) -> Void) {
         self.jev = jev
         self.apps = apps
-        self.pointer = pointer
         self.prefetched = prefetched
         self.onStep = onStep
     }
@@ -134,12 +132,10 @@ final class Agent {
             let targetConfidence = answers["target"]?.confidence ?? 0
             unsureSteps = (actionConfidence < 0.5 && targetConfidence < 0.5) ? unsureSteps + 1 : 0
             if unsureSteps >= 2 && done < doneThreshold {
-                pointer.hide()
                 return .failed("Not sure how to do that")
             }
 
             if done >= doneThreshold {
-                pointer.hide()
                 return .done(history.last ?? "Done")
             }
 
@@ -156,8 +152,6 @@ final class Agent {
                     break
                 }
                 onStep("Typing \(text)")
-                if let field { await pointer.move(to: field.center, label: "Type “\(text)”") }
-                pointer.clickPulse()
                 lastTypedIntoChat = Self.isMessageBox(field)
                 let landed = await Input.type(text, into: field)
                 log("  typed \"\(text)\" landed=\(landed)")
@@ -175,17 +169,14 @@ final class Agent {
             default:
                 guard let id = answers["target"]?.choice, let element = screen.element(id),
                       (answers["target"]?.confidence ?? 0) >= minConfidence else {
-                    pointer.hide()
                     return .failed("Not sure what to click")
                 }
                 let stepKey = "click:\(element.summary)"
+                // Wanting the same click again means the last one already did its job.
                 guard stepKey != lastStep else {
-                    pointer.hide()
-                    return .failed("Got stuck on \(element.label)")
+                    return .done(history.last ?? "Done")
                 }
                 onStep("Clicking \(element.label)")
-                await pointer.move(to: element.center, label: element.label)
-                pointer.clickPulse()
                 Input.click(element)
                 history.append("Clicked \(element.summary)")
                 lastStep = stepKey
@@ -194,7 +185,6 @@ final class Agent {
             try await Task.sleep(for: .seconds(1.0))  // let the UI settle
         }
 
-        pointer.hide()
         return .failed("Ran out of steps")
     }
 

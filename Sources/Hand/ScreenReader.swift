@@ -123,7 +123,13 @@ enum ScreenReader {
 
     /// Adds screenshot text that Accessibility didn't already cover, then numbers everything.
     private static func merge(_ ax: [UIElement], with text: [ScreenVision.TextBox]) -> [UIElement] {
-        var all = ax
+        // Qt apps label buttons with code names ("ExportOkBtn"); prefer the words drawn on them.
+        var all = ax.map { e -> UIElement in
+            guard looksLikeIdentifier(e.label),
+                  let shown = text.first(where: { e.frame.insetBy(dx: -2, dy: -2).contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) })
+            else { return e }
+            return UIElement(id: e.id, role: e.role, label: "\(shown.text) (\(e.label))", frame: e.frame, ax: e.ax, canPress: e.canPress)
+        }
         for box in text where all.count < maxTotal {
             let center = CGPoint(x: box.frame.midX, y: box.frame.midY)
             let covered = ax.contains { e in
@@ -154,6 +160,13 @@ enum ScreenReader {
             }
         }
         return kept
+    }
+
+    /// "ExportOkBtn", "automationcancel", "save_button": no spaces, reads like code.
+    private static func looksLikeIdentifier(_ label: String) -> Bool {
+        guard !label.contains(" "), label.count > 3 else { return false }
+        let hasInnerCapital = label.dropFirst().contains(where: \.isUppercase)
+        return hasInnerCapital || label.contains("_") || label == label.lowercased()
     }
 
     // MARK: - AX helpers

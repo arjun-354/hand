@@ -20,7 +20,6 @@ final class HandState {
     var level: Double = 0
 
     @ObservationIgnored private let speech = SpeechListener()
-    @ObservationIgnored let pointer = Pointer()
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var permissionsOK = false
     /// Screen read started the moment the talk key goes down, so it's ready when you stop talking.
@@ -29,13 +28,14 @@ final class HandState {
     init() {
         speech.onPartial = { [weak self] in self?.transcript = $0 }
         speech.onLevel = { [weak self] in self?.level = $0 }
+        speech.vocabulary = ["4K", "1080p", "720p", "1440p", "60fps", "30fps", "24fps", "HEVC", "H.264", "MP4",
+                             "export", "Weeknd", "System Settings"] + AppCatalog.scan().map(\.name)
         log("started: \(AppCatalog.scan().count) apps, jev \(JevClient.fromConfig() == nil ? "NOT configured" : "configured"), accessibility \(AXIsProcessTrusted()), screen recording \(ScreenVision.hasPermission)")
     }
 
     /// Pressing the talk key also cancels whatever Hand was doing.
     func startListening() {
         task?.cancel()
-        pointer.hide()
         transcript = ""
         level = 0
         phase = .listening
@@ -76,7 +76,7 @@ final class HandState {
         transcript = text
         let seen = prefetch
         prefetch = nil
-        let agent = Agent(jev: jev, apps: AppCatalog.scan(), pointer: pointer, prefetched: seen) { [weak self] step in
+        let agent = Agent(jev: jev, apps: AppCatalog.scan(), prefetched: seen) { [weak self] step in
             guard !Task.isCancelled else { return }  // a new talk press took over
             self?.phase = .working(step)
         }
@@ -86,12 +86,11 @@ final class HandState {
             guard !Task.isCancelled else { return }
             finish(result)
         } catch is CancellationError {
-            pointer.hide()
+            // A new talk press took over; it owns the notch now.
         } catch let error as URLError where error.code == .cancelled {
-            pointer.hide()
+            // Same, but the cancel landed during a Jev request.
         } catch {
             log("agent error: \(error)")
-            pointer.hide()
             finish(.failed("\(error)"))
         }
     }

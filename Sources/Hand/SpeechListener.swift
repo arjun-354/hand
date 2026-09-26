@@ -6,6 +6,8 @@ import Speech
 final class SpeechListener {
     var onPartial: ((String) -> Void)?
     var onLevel: ((Double) -> Void)?
+    /// Words the recognizer should expect: app names, UI terms like "4K".
+    var vocabulary: [String] = []
 
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private let engine = AVAudioEngine()
@@ -69,6 +71,7 @@ final class SpeechListener {
         request.shouldReportPartialResults = true
         request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
         request.addsPunctuation = false
+        request.contextualStrings = Array(vocabulary.prefix(100))
         self.request = request
         audioSink.request = request
         passes += 1
