@@ -8,10 +8,10 @@ Decisions are made by [TypeSafe's Jev](https://docs.typesafe.ai), a System One m
 
 1. **Listen** — push-to-talk, Apple on-device speech recognition (`SpeechListener`).
 2. **Route** — one Jev call: what kind of request (open / quit / operate / other) and which installed app (`Agent`).
-3. **See** — the front window is read through the Accessibility API and flattened into a labelled list like `e5: search field: What do you want to play?` (`ScreenReader`).
+3. **See** — the front window is read through the Accessibility API and merged with on-device OCR of a screenshot of the app's windows (`ScreenReader`, `ScreenVision`). Each item is labelled with its section, like `e5: button: New page (in "Scripting")`. The first read starts the moment the talk key goes down.
 4. **Decide** — one Jev call per step asks in parallel: is the goal done, click/type/submit, which element, which field, and which words from the request to type.
 5. **Remember "this"** — at key-down Hand also records the front app's link, title, selected text and clipboard, so "add the link to this reel to Notion" can paste the reel's URL after switching apps (`SourceContext`).
-6. **Act** — a glowing pointer glides to the element, then Hand clicks or pastes text (`Pointer`, `Input`). Loops up to 8 steps.
+6. **Act** — Hand clicks or pastes text (`Input`), then looks again. Loops up to 8 steps, stops early when unsure, and never presses Return in a chat box unless you said send/message/reply.
 
 The notch UI (`NotchView`, `NotchWindow`) drops out of the camera housing and shows each step live.
 
@@ -26,13 +26,13 @@ scripts/test-jev.sh
 scripts/build-app.sh --run
 ```
 
-Grant **Accessibility**, **Microphone**, and **Speech Recognition** to Hand when asked. The build is signed with your Apple Development identity when one exists, so grants survive rebuilds.
+Grant **Accessibility**, **Screen Recording**, **Microphone**, and **Speech Recognition** to Hand when asked. The build is signed with your Apple Development identity when one exists, so grants survive rebuilds.
 
 Requires macOS 14+ and Swift 5.10+ (Command Line Tools are enough, no Xcode project).
 
 ## Debugging
 
-Logs go to `~/Library/Logs/Hand/` — `hand.log` for every run, `last-screen.txt` for what Hand last saw.
+Logs go to `~/Library/Logs/Hand/` — `hand.log` for every run, `last-screen.txt` for what Hand last saw, `last-capture.png` for its last screenshot.
 
 ```bash
 open build/Hand.app --args --say "open storage in settings"   # run a command without speaking
@@ -44,6 +44,6 @@ open build/Hand.app --args --demo                             # notch animation 
 
 ## Known limits
 
-- Sees text labels, not pixels: unlabeled icon buttons are invisible.
-- Can only type words that were spoken; Jev doesn't generate text.
+- Sees text (accessibility labels + OCR), not icons: an unlabeled icon-only button is invisible.
+- Can only type words you spoke or values from what you were looking at (link, title, selection, clipboard); Jev doesn't generate text.
 - Chromium Embedded apps (Spotify) are relaunched once with `--force-renderer-accessibility` so their UI is readable.
