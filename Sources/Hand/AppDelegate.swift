@@ -8,7 +8,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkey: HotkeyMonitor?
     private var statusItem: NSStatusItem?
 
+    func applicationWillTerminate(_ notification: Notification) {
+        log("quitting normally")
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Fatal errors print to stderr, which goes nowhere for an app opened from Finder.
+        freopen(Log.dir.appendingPathComponent("stderr.log").path, "a", stderr)
         let panel = NotchPanel(state: state)
         panel.orderFrontRegardless()
         self.panel = panel
