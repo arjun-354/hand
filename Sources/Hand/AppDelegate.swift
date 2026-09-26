@@ -23,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setUpStatusItem()
         requestAccessibilityIfNeeded()
+        if !ScreenVision.hasPermission { ScreenVision.requestPermission() }
+        ScreenVision.warmUp()
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main

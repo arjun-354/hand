@@ -8,15 +8,22 @@ final class Agent {
     let apps: [InstalledApp]
     let pointer: Pointer
     let onStep: (String) -> Void
+    /// Screen read taken when the talk key went down.
+    let prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)?
+    /// Apps already relaunched for accessibility this session; never do it twice.
+    private static var relaunchedApps: Set<String> = []
 
     let maxSteps = 8
     let minConfidence = 0.25
     let doneThreshold = 0.6
 
-    init(jev: JevClient, apps: [InstalledApp], pointer: Pointer, onStep: @escaping (String) -> Void) {
+    init(jev: JevClient, apps: [InstalledApp], pointer: Pointer,
+         prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)? = nil,
+         onStep: @escaping (String) -> Void) {
         self.jev = jev
         self.apps = apps
         self.pointer = pointer
+        self.prefetched = prefetched
         self.onStep = onStep
     }
 
@@ -88,8 +95,14 @@ final class Agent {
         for step in 1...maxSteps {
             try Task.checkCancellation()
             guard let app = NSWorkspace.shared.frontmostApplication else { break }
-            var screen = await ScreenReader.snapshot(of: app)
-            if screen.elements.count < 5, !relaunched, await relaunchAccessible(app),
+            var screen: ScreenSnapshot
+            if step == 1, let prefetched, prefetched.pid == app.processIdentifier {
+                screen = await prefetched.snapshot.value  // captured while you were talking
+            } else {
+                screen = await ScreenReader.snapshot(of: app)
+            }
+            let axCount = screen.elements.filter { $0.ax != nil }.count
+            if axCount < 5, !relaunched, await relaunchAccessible(app),
                let fresh = NSWorkspace.shared.frontmostApplication {
                 relaunched = true
                 screen = await ScreenReader.snapshot(of: fresh)
@@ -97,7 +110,9 @@ final class Agent {
             log("step \(step): \(screen.appName) \"\(screen.windowTitle)\" \(screen.elements.count) elements")
             dumpScreen(screen)
             guard !screen.elements.isEmpty else {
-                return .failed(AXIsProcessTrusted() ? "Can't see \(screen.appName)'s screen" : "Allow Accessibility for Hand")
+                if !AXIsProcessTrusted() { return .failed("Allow Accessibility for Hand") }
+                if !ScreenVision.hasPermission { return .failed("Allow Screen Recording for Hand") }
+                return .failed("Can't see \(screen.appName)'s screen")
             }
 
             let answers = try await jev.ask(state: [
@@ -228,13 +243,18 @@ final class Agent {
 
     /// CEF apps (Spotify) ignore AXManualAccessibility and only expose their UI
     /// when launched with this flag.
+    /// Qt apps (CapCut) also bundle CEF, but draw their UI themselves; the flag doesn't help them.
     static func needsAccessibilityFlag(_ url: URL) -> Bool {
-        FileManager.default.fileExists(atPath: url.appendingPathComponent("Contents/Frameworks/Chromium Embedded Framework.framework").path)
+        let frameworks = url.appendingPathComponent("Contents/Frameworks")
+        let has = { FileManager.default.fileExists(atPath: frameworks.appendingPathComponent($0).path) }
+        return has("Chromium Embedded Framework.framework") && !has("QtCore.framework")
     }
 
     /// Relaunches a CEF app with its accessibility tree switched on.
     private func relaunchAccessible(_ app: NSRunningApplication) async -> Bool {
-        guard let url = app.bundleURL, Self.needsAccessibilityFlag(url) else { return false }
+        guard let url = app.bundleURL, Self.needsAccessibilityFlag(url),
+              let bundleID = app.bundleIdentifier, !Self.relaunchedApps.contains(bundleID) else { return false }
+        Self.relaunchedApps.insert(bundleID)
         log("relaunching \(app.localizedName ?? "") with --force-renderer-accessibility")
         onStep("Restarting \(app.localizedName ?? "app") so I can see it")
         app.terminate()

@@ -23,11 +23,13 @@ final class HandState {
     @ObservationIgnored let pointer = Pointer()
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var permissionsOK = false
+    /// Screen read started the moment the talk key goes down, so it's ready when you stop talking.
+    @ObservationIgnored private var prefetch: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)?
 
     init() {
         speech.onPartial = { [weak self] in self?.transcript = $0 }
         speech.onLevel = { [weak self] in self?.level = $0 }
-        log("started: \(AppCatalog.scan().count) apps, jev \(JevClient.fromConfig() == nil ? "NOT configured" : "configured"), accessibility \(AXIsProcessTrusted())")
+        log("started: \(AppCatalog.scan().count) apps, jev \(JevClient.fromConfig() == nil ? "NOT configured" : "configured"), accessibility \(AXIsProcessTrusted()), screen recording \(ScreenVision.hasPermission)")
     }
 
     /// Pressing the talk key also cancels whatever Hand was doing.
@@ -37,6 +39,9 @@ final class HandState {
         transcript = ""
         level = 0
         phase = .listening
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() {
+            prefetch = (front.processIdentifier, Task { await ScreenReader.snapshot(of: front) })
+        }
         task = Task {
             if !permissionsOK {
                 if let failure = await SpeechListener.requestPermissions() {
@@ -69,7 +74,9 @@ final class HandState {
         }
         phase = .thinking
         transcript = text
-        let agent = Agent(jev: jev, apps: AppCatalog.scan(), pointer: pointer) { [weak self] step in
+        let seen = prefetch
+        prefetch = nil
+        let agent = Agent(jev: jev, apps: AppCatalog.scan(), pointer: pointer, prefetched: seen) { [weak self] step in
             guard !Task.isCancelled else { return }  // a new talk press took over
             self?.phase = .working(step)
         }

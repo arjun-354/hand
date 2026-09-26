@@ -8,7 +8,8 @@ struct UIElement {
     let label: String
     /// Global screen coordinates, top-left origin (same space as CGEvent).
     let frame: CGRect
-    let ax: AXUIElement
+    /// nil for text Hand saw in a screenshot rather than read through Accessibility.
+    let ax: AXUIElement?
     let canPress: Bool
 
     var isTextInput: Bool { ["AXTextField", "AXSearchField", "AXTextArea", "AXComboBox"].contains(role) }
@@ -30,10 +31,14 @@ struct UIElement {
         case "AXSlider": "slider"
         case "AXStaticText": "text"
         case "AXImage": "image"
+        case visibleTextRole: "on screen"
         default: role.replacingOccurrences(of: "AX", with: "").lowercased()
         }
     }
 }
+
+/// Role for text found by ScreenVision in a screenshot.
+let visibleTextRole = "HandVisibleText"
 
 struct ScreenSnapshot {
     let appName: String
@@ -47,7 +52,9 @@ struct ScreenSnapshot {
 /// it into a list of labelled, actionable elements.
 @MainActor
 enum ScreenReader {
-    static let maxElements = 220
+    /// Jev accepts up to 255 options per choice; leave room for vision results.
+    static let maxElements = 180
+    static let maxTotal = 250
     private static var enhanced: Set<pid_t> = []
 
     private static let interactiveRoles: Set<String> = [
@@ -56,7 +63,16 @@ enum ScreenReader {
         "AXCell", "AXTab", "AXDisclosureTriangle", "AXSlider",
     ]
 
+    /// Everything Hand can see in `app`: its accessibility tree merged with the
+    /// text in a screenshot of its windows (read in parallel).
     static func snapshot(of app: NSRunningApplication) async -> ScreenSnapshot {
+        async let seen = ScreenVision.readText(pid: app.processIdentifier)
+        let (title, axElements) = await accessibilityElements(of: app)
+        let merged = merge(axElements, with: await seen)
+        return ScreenSnapshot(appName: app.localizedName ?? "", windowTitle: title, elements: merged)
+    }
+
+    private static func accessibilityElements(of app: NSRunningApplication) async -> (String, [UIElement]) {
         let root = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(root, 1.5)
 
@@ -72,9 +88,7 @@ enum ScreenReader {
         let window = element(root, "AXFocusedWindow")
             ?? element(root, "AXMainWindow")
             ?? ((attr(root, "AXWindows") as? [AXUIElement])?.first)
-        guard let window else {
-            return ScreenSnapshot(appName: app.localizedName ?? "", windowTitle: "", elements: [])
-        }
+        guard let window else { return ("", []) }
 
         let bounds = frame(of: window) ?? .infinite
         var out: [UIElement] = []
@@ -104,11 +118,26 @@ enum ScreenReader {
             }
         }
         walk(window, depth: 0)
-        out = pruneDuplicates(out)
+        return (string(window, "AXTitle"), pruneDuplicates(out))
+    }
 
-        return ScreenSnapshot(appName: app.localizedName ?? "",
-                              windowTitle: string(window, "AXTitle"),
-                              elements: out)
+    /// Adds screenshot text that Accessibility didn't already cover, then numbers everything.
+    private static func merge(_ ax: [UIElement], with text: [ScreenVision.TextBox]) -> [UIElement] {
+        var all = ax
+        for box in text where all.count < maxTotal {
+            let center = CGPoint(x: box.frame.midX, y: box.frame.midY)
+            let covered = ax.contains { e in
+                e.frame.insetBy(dx: -4, dy: -4).contains(center)
+                    && (e.label.localizedCaseInsensitiveContains(box.text) || box.text.localizedCaseInsensitiveContains(e.label))
+            }
+            if !covered {
+                all.append(UIElement(id: "", role: visibleTextRole, label: box.text,
+                                     frame: box.frame, ax: nil, canPress: false))
+            }
+        }
+        return all.enumerated().map { i, e in
+            UIElement(id: "e\(i)", role: e.role, label: e.label, frame: e.frame, ax: e.ax, canPress: e.canPress)
+        }
     }
 
     /// Web apps nest a row, its text and its button at the same spot. Keep the
@@ -124,9 +153,7 @@ enum ScreenReader {
                     && !e.isTextInput
             }
         }
-        return kept.enumerated().map { i, e in
-            UIElement(id: "e\(i)", role: e.role, label: e.label, frame: e.frame, ax: e.ax, canPress: e.canPress)
-        }
+        return kept
     }
 
     // MARK: - AX helpers
