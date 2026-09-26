@@ -15,8 +15,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hotkey = HotkeyMonitor(
             key: .rightOption,
-            onPress: { [state] in Task { @MainActor in state.startListening() } },
-            onRelease: { [state] in Task { @MainActor in state.stopListening() } }
+            // Called synchronously on the main thread so press and release can never run out of order.
+            onPress: { [state] in MainActor.assumeIsolated { state.startListening() } },
+            onRelease: { [state] in MainActor.assumeIsolated { state.stopListening() } }
         )
         hotkey?.start()
 

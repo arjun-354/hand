@@ -70,13 +70,17 @@ final class HandState {
         phase = .thinking
         transcript = text
         let agent = Agent(jev: jev, apps: AppCatalog.scan(), pointer: pointer) { [weak self] step in
+            guard !Task.isCancelled else { return }  // a new talk press took over
             self?.phase = .working(step)
         }
         do {
             let result = try await agent.run(text)
             log("result: \(result)")
+            guard !Task.isCancelled else { return }
             finish(result)
         } catch is CancellationError {
+            pointer.hide()
+        } catch let error as URLError where error.code == .cancelled {
             pointer.hide()
         } catch {
             log("agent error: \(error)")

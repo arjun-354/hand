@@ -79,11 +79,22 @@ final class HotkeyMonitor {
         onPress()
         // Key-up events can get lost (secure input, other modifiers). Poll the real
         // key state so Hand never gets stuck listening.
+        // NSEvent.modifierFlags reads the live modifier state without the Input
+        // Monitoring permission (CGEventSource.keyState needs it and reads false).
+        // Require several "up" reads in a row so a flaky read can't cut you off.
         watchdog?.invalidate()
+        var upReads = 0
         watchdog = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self, self.isDown else { return }
-            let held = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(self.key.keyCode))
-            if !held || Date().timeIntervalSince(self.pressedAt) > self.maxHold { self.release() }
+            if Date().timeIntervalSince(self.pressedAt) > self.maxHold {
+                log("talk key: released by \(Int(self.maxHold))s limit")
+                self.release(); return
+            }
+            upReads = NSEvent.modifierFlags.contains(self.key.flag) ? 0 : upReads + 1
+            if upReads >= 3 {
+                log("talk key: released by watchdog (key-up event was missed)")
+                self.release()
+            }
         }
     }
 
