@@ -34,6 +34,10 @@ final class HotkeyMonitor {
     private let onRelease: () -> Void
     private var monitors: [Any] = []
     private var isDown = false
+    private var watchdog: Timer?
+    private var pressedAt = Date()
+    /// Listening stops on its own after this long, even if the key still reads as held.
+    private let maxHold: TimeInterval = 20
 
     init(key: TalkKey, onPress: @escaping () -> Void, onRelease: @escaping () -> Void) {
         self.key = key
@@ -63,11 +67,31 @@ final class HotkeyMonitor {
         guard event.keyCode == key.keyCode else { return }
         let pressed = event.modifierFlags.contains(key.flag)
         if pressed && !isDown {
-            isDown = true
-            onPress()
+            press()
         } else if !pressed && isDown {
-            isDown = false
-            onRelease()
+            release()
         }
+    }
+
+    private func press() {
+        isDown = true
+        pressedAt = Date()
+        onPress()
+        // Key-up events can get lost (secure input, other modifiers). Poll the real
+        // key state so Hand never gets stuck listening.
+        watchdog?.invalidate()
+        watchdog = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self, self.isDown else { return }
+            let held = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(self.key.keyCode))
+            if !held || Date().timeIntervalSince(self.pressedAt) > self.maxHold { self.release() }
+        }
+    }
+
+    private func release() {
+        watchdog?.invalidate()
+        watchdog = nil
+        guard isDown else { return }
+        isDown = false
+        onRelease()
     }
 }

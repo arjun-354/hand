@@ -83,6 +83,8 @@ final class Agent {
         let spans = Self.spans(of: goal)
         var lastStep = ""
         var relaunched = false
+        var lastTypedIntoChat = false
+        var unsureSteps = 0
         for step in 1...maxSteps {
             try Task.checkCancellation()
             guard let app = NSWorkspace.shared.frontmostApplication else { break }
@@ -109,9 +111,17 @@ final class Agent {
             let done = answers["done"]?.noul ?? 0
             // Return only makes sense right after typing; otherwise take Jev's best remaining option.
             var probs = answers["action"]?.probabilities ?? [:]
-            if !lastStep.hasPrefix("type:") { probs["submit"] = nil }
+            if !lastStep.hasPrefix("type:") || (lastTypedIntoChat && !Self.asksToSend(goal)) { probs["submit"] = nil }
             let action = probs.max { $0.value < $1.value }?.key ?? "click"
             log("  done=\(fmt(done)) action=\(action) (\(fmt(answers["action"]?.confidence))) target=\(answers["target"]?.choice ?? "-") (\(fmt(answers["target"]?.confidence))) field=\(answers["field"]?.choice ?? "-") text=\(answers["text"]?.choice ?? "-")")
+
+            let actionConfidence = answers["action"]?.confidence ?? 0
+            let targetConfidence = answers["target"]?.confidence ?? 0
+            unsureSteps = (actionConfidence < 0.5 && targetConfidence < 0.5) ? unsureSteps + 1 : 0
+            if unsureSteps >= 2 && done < doneThreshold {
+                pointer.hide()
+                return .failed("Not sure how to do that")
+            }
 
             if done >= doneThreshold {
                 pointer.hide()
@@ -133,6 +143,7 @@ final class Agent {
                 onStep("Typing \(text)")
                 if let field { await pointer.move(to: field.center, label: "Type “\(text)”") }
                 pointer.clickPulse()
+                lastTypedIntoChat = Self.isMessageBox(field)
                 let landed = await Input.type(text, into: field)
                 log("  typed \"\(text)\" landed=\(landed)")
                 history.append(landed
@@ -193,7 +204,7 @@ final class Agent {
                 "instructions": "What is the single best next step toward the `goal`, given `steps_done` and what is on `screen`?",
                 "criteria": [
                     "click": "Click an item on screen: a button, list item, link, tab, sidebar entry, or search result",
-                    "type": "Type text into a search box or text field that doesn't already contain it",
+                    "type": "Type text into a search box or text field that doesn't already contain it. Only when the goal asks to search for, play, find, write, or type something specific",
                     "submit": "Press Return to submit text that was just typed",
                 ],
             ],
@@ -254,6 +265,20 @@ final class Agent {
             try? await Task.sleep(for: .seconds(0.1))
         }
         return NSWorkspace.shared.frontmostApplication?.processIdentifier == running.processIdentifier
+    }
+
+    /// Words that mean the user actually wants something sent.
+    static func asksToSend(_ goal: String) -> Bool {
+        let g = goal.lowercased()
+        return ["send", "message", "reply", "text ", "tell ", "post", "tweet", "email"].contains { g.contains($0) }
+    }
+
+    /// Text areas and fields that look like a chat composer, where Return sends.
+    static func isMessageBox(_ element: UIElement?) -> Bool {
+        guard let element else { return false }
+        if element.role == "AXTextArea" { return true }
+        let l = element.label.lowercased()
+        return ["message", "reply", "chat", "write", "ask", "compose", "prompt", "type a", "how can i help"].contains { l.contains($0) }
     }
 
     /// Every run of 1–6 consecutive words, so Jev can pick the part to type.
