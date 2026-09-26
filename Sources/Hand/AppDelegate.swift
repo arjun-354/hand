@@ -58,16 +58,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = AXIsProcessTrustedWithOptions(options)
     }
 
-    private func runDemo() {
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(0.6))
-            state.startListening()
-            try? await Task.sleep(for: .seconds(1.0))
-            for word in ["open", "open Spotify", "open Spotify and play", "open Spotify and play my liked songs"] {
-                state.transcript = word
-                try? await Task.sleep(for: .seconds(0.45))
-            }
-            state.stopListening()
-        }
-    }
+    private func runDemo() { state.playDemo() }
 }
