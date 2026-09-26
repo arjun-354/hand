@@ -104,36 +104,55 @@ enum ScreenReader {
             }
         }
         walk(window, depth: 0)
+        out = pruneDuplicates(out)
 
         return ScreenSnapshot(appName: app.localizedName ?? "",
                               windowTitle: string(window, "AXTitle"),
                               elements: out)
     }
 
+    /// Web apps nest a row, its text and its button at the same spot. Keep the
+    /// most descriptive one and renumber so ids stay compact.
+    private static func pruneDuplicates(_ elements: [UIElement]) -> [UIElement] {
+        let kept = elements.filter { e in
+            if e.label == "•" { return false }
+            return !elements.contains { other in
+                other.id != e.id
+                    && abs(other.center.x - e.center.x) < 6 && abs(other.center.y - e.center.y) < 6
+                    && other.label.count > e.label.count
+                    && other.label.localizedCaseInsensitiveContains(e.label.components(separatedBy: " — ").first ?? e.label)
+                    && !e.isTextInput
+            }
+        }
+        return kept.enumerated().map { i, e in
+            UIElement(id: "e\(i)", role: e.role, label: e.label, frame: e.frame, ax: e.ax, canPress: e.canPress)
+        }
+    }
+
     // MARK: - AX helpers
 
-    static func attr(_ e: AXUIElement, _ name: String) -> AnyObject? {
+    nonisolated static func attr(_ e: AXUIElement, _ name: String) -> AnyObject? {
         var value: AnyObject?
         guard AXUIElementCopyAttributeValue(e, name as CFString, &value) == .success else { return nil }
         return value
     }
 
-    static func element(_ e: AXUIElement, _ name: String) -> AXUIElement? {
+    nonisolated static func element(_ e: AXUIElement, _ name: String) -> AXUIElement? {
         guard let value = attr(e, name), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
         return (value as! AXUIElement)
     }
 
-    static func string(_ e: AXUIElement, _ name: String) -> String {
+    nonisolated static func string(_ e: AXUIElement, _ name: String) -> String {
         (attr(e, name) as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    static func actionNames(_ e: AXUIElement) -> [String] {
+    nonisolated static func actionNames(_ e: AXUIElement) -> [String] {
         var names: CFArray?
         AXUIElementCopyActionNames(e, &names)
         return (names as? [String]) ?? []
     }
 
-    static func frame(of e: AXUIElement) -> CGRect? {
+    nonisolated static func frame(of e: AXUIElement) -> CGRect? {
         guard let posValue = attr(e, "AXPosition"), let sizeValue = attr(e, "AXSize") else { return nil }
         var pos = CGPoint.zero, size = CGSize.zero
         AXValueGetValue(posValue as! AXValue, .cgPoint, &pos)

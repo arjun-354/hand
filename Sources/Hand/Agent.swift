@@ -10,8 +10,8 @@ final class Agent {
     let onStep: (String) -> Void
 
     let maxSteps = 8
-    let minConfidence = 0.35
-    let doneThreshold = 0.75
+    let minConfidence = 0.25
+    let doneThreshold = 0.6
 
     init(jev: JevClient, apps: [InstalledApp], pointer: Pointer, onStep: @escaping (String) -> Void) {
         self.jev = jev
@@ -82,10 +82,16 @@ final class Agent {
         // 3. Act, one step at a time.
         let spans = Self.spans(of: goal)
         var lastStep = ""
+        var relaunched = false
         for step in 1...maxSteps {
             try Task.checkCancellation()
             guard let app = NSWorkspace.shared.frontmostApplication else { break }
-            let screen = await ScreenReader.snapshot(of: app)
+            var screen = await ScreenReader.snapshot(of: app)
+            if screen.elements.count < 5, !relaunched, await relaunchAccessible(app),
+               let fresh = NSWorkspace.shared.frontmostApplication {
+                relaunched = true
+                screen = await ScreenReader.snapshot(of: fresh)
+            }
             log("step \(step): \(screen.appName) \"\(screen.windowTitle)\" \(screen.elements.count) elements")
             dumpScreen(screen)
             guard !screen.elements.isEmpty else {
@@ -101,10 +107,13 @@ final class Agent {
             ], questions: questions(for: screen, spans: spans))
 
             let done = answers["done"]?.noul ?? 0
-            let action = answers["action"]?.choice ?? "click"
+            // Return only makes sense right after typing; otherwise take Jev's best remaining option.
+            var probs = answers["action"]?.probabilities ?? [:]
+            if !lastStep.hasPrefix("type:") { probs["submit"] = nil }
+            let action = probs.max { $0.value < $1.value }?.key ?? "click"
             log("  done=\(fmt(done)) action=\(action) (\(fmt(answers["action"]?.confidence))) target=\(answers["target"]?.choice ?? "-") (\(fmt(answers["target"]?.confidence))) field=\(answers["field"]?.choice ?? "-") text=\(answers["text"]?.choice ?? "-")")
 
-            if done >= doneThreshold && !history.isEmpty {
+            if done >= doneThreshold {
                 pointer.hide()
                 return .done(history.last ?? "Done")
             }
@@ -124,8 +133,11 @@ final class Agent {
                 onStep("Typing \(text)")
                 if let field { await pointer.move(to: field.center, label: "Type “\(text)”") }
                 pointer.clickPulse()
-                await Input.type(text, into: field)
-                history.append("Typed \"\(text)\" into \(field?.summary ?? "the focused field")")
+                let landed = await Input.type(text, into: field)
+                log("  typed \"\(text)\" landed=\(landed)")
+                history.append(landed
+                    ? "Typed \"\(text)\" into \(field?.summary ?? "the focused field")"
+                    : "Tried to type \"\(text)\" but the field stayed empty")
                 lastStep = stepKey
 
             case "submit":
@@ -173,7 +185,8 @@ final class Agent {
         return [
             "done": [
                 "type": "noul",
-                "instructions": "Judging by `steps_done` and what is on `screen`, has the `goal` been fully accomplished?",
+                // Picked by testing phrasings against recorded screens; separates done/not-done best.
+                "instructions": "Does the `window` title or the last entry of `steps_done` show that the `goal` has been achieved?",
             ],
             "action": [
                 "type": "choice",
@@ -202,9 +215,29 @@ final class Agent {
         ]
     }
 
+    /// CEF apps (Spotify) ignore AXManualAccessibility and only expose their UI
+    /// when launched with this flag.
+    static func needsAccessibilityFlag(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.appendingPathComponent("Contents/Frameworks/Chromium Embedded Framework.framework").path)
+    }
+
+    /// Relaunches a CEF app with its accessibility tree switched on.
+    private func relaunchAccessible(_ app: NSRunningApplication) async -> Bool {
+        guard let url = app.bundleURL, Self.needsAccessibilityFlag(url) else { return false }
+        log("relaunching \(app.localizedName ?? "") with --force-renderer-accessibility")
+        onStep("Restarting \(app.localizedName ?? "app") so I can see it")
+        app.terminate()
+        for _ in 0..<50 where !app.isTerminated { try? await Task.sleep(for: .seconds(0.1)) }
+        let installed = InstalledApp(name: app.localizedName ?? "", url: url)
+        guard await bringToFront(installed) else { return false }
+        try? await Task.sleep(for: .seconds(2.5))  // web content loads after the window appears
+        return true
+    }
+
     private func bringToFront(_ app: InstalledApp) async -> Bool {
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
+        if Self.needsAccessibilityFlag(app.url) { config.arguments = ["--force-renderer-accessibility"] }
         guard let running = try? await NSWorkspace.shared.openApplication(at: app.url, configuration: config) else {
             return false
         }

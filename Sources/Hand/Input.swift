@@ -24,15 +24,46 @@ enum Input {
         }
     }
 
-    /// Focuses a text input, clears it and types `text`.
-    static func type(_ text: String, into element: UIElement?) async {
+    /// Focuses a text input, replaces its contents with `text`, and reports whether it landed.
+    @discardableResult
+    static func type(_ text: String, into element: UIElement?) async -> Bool {
         if let element {
-            AXUIElementSetAttributeValue(element.ax, "AXFocused" as CFString, kCFBooleanTrue)
             mouseClick(at: element.center)
-            try? await Task.sleep(for: .seconds(0.15))
-            key(kVK_ANSI_A, flags: .maskCommand)  // select existing text so typing replaces it
+            AXUIElementSetAttributeValue(element.ax, "AXFocused" as CFString, kCFBooleanTrue)
+            try? await Task.sleep(for: .seconds(0.25))
         }
+        key(kVK_ANSI_A, flags: .maskCommand)  // select existing text so the paste replaces it
+        await paste(text)
+        try? await Task.sleep(for: .seconds(0.2))
+
+        guard let element else { return true }
+        if ScreenReader.string(element.ax, "AXValue").localizedCaseInsensitiveContains(text) { return true }
+        // Paste didn't take: try setting the value directly, then real keystrokes.
+        AXUIElementSetAttributeValue(element.ax, "AXValue" as CFString, text as CFString)
+        try? await Task.sleep(for: .seconds(0.15))
+        if ScreenReader.string(element.ax, "AXValue").localizedCaseInsensitiveContains(text) { return true }
         typeString(text)
+        try? await Task.sleep(for: .seconds(0.2))
+        return ScreenReader.string(element.ax, "AXValue").localizedCaseInsensitiveContains(text)
+    }
+
+    /// Pastes through the clipboard (web views accept this reliably), then restores the clipboard.
+    static func paste(_ text: String) async {
+        let board = NSPasteboard.general
+        let saved = board.pasteboardItems?.map { item in
+            item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
+        } ?? []
+        board.clearContents()
+        board.setString(text, forType: .string)
+        key(kVK_ANSI_V, flags: .maskCommand)
+        try? await Task.sleep(for: .seconds(0.3))
+        board.clearContents()
+        let restored = saved.map { pairs -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in pairs { item.setData(data, forType: type) }
+            return item
+        }
+        if !restored.isEmpty { board.writeObjects(restored) }
     }
 
     static func typeString(_ text: String) {

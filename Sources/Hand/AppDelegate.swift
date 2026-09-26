@@ -72,6 +72,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await state.run(text)
             }
         }
+        if let i = args.firstIndex(of: "--axtree"), i + 1 < args.count {
+            let bundleID = args[i + 1]
+            Task { @MainActor in
+                guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { return }
+                let root = AXUIElementCreateApplication(app.processIdentifier)
+                AXUIElementSetAttributeValue(root, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+                AXUIElementSetAttributeValue(root, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+                try? await Task.sleep(for: .seconds(2))
+                var lines: [String] = []
+                func walk(_ e: AXUIElement, _ d: Int) {
+                    guard d < 30, lines.count < 600 else { return }
+                    let kids = (ScreenReader.attr(e, "AXChildren") as? [AXUIElement]) ?? []
+                    let label = [ScreenReader.string(e, "AXTitle"), ScreenReader.string(e, "AXDescription"), ScreenReader.string(e, "AXValue")].filter { !$0.isEmpty }.joined(separator: " | ")
+                    lines.append(String(repeating: "  ", count: d) + ScreenReader.string(e, "AXRole") + " (\(kids.count)) " + String(label.prefix(60)) + " " + ScreenReader.actionNames(e).joined(separator: ","))
+                    kids.forEach { walk($0, d + 1) }
+                }
+                walk(root, 0)
+                Log.write(lines.joined(separator: "\n"), to: "axtree.txt")
+            }
+        }
         if let i = args.firstIndex(of: "--axdump"), i + 1 < args.count {
             let bundleID = args[i + 1]
             Task { @MainActor in
