@@ -215,7 +215,7 @@ final class Agent {
             ],
             "target": [
                 "type": "choice",
-                "instructions": "Which item on `screen` should be clicked next to move toward the `goal`?",
+                "instructions": "Which item on `screen` should be clicked next to move toward the `goal`? Items with the same name are told apart by the section in brackets; pick the one in the section the goal names. Tags and headers name a section, they don't add to it.",
                 "criteria": targets,
             ],
             "field": [

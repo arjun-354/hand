@@ -11,12 +11,17 @@ struct UIElement {
     /// nil for text Hand saw in a screenshot rather than read through Accessibility.
     let ax: AXUIElement?
     let canPress: Bool
+    /// Which section it sits in, e.g. `in "Scripting", under "Production Board"`.
+    var context = ""
 
     var isTextInput: Bool { ["AXTextField", "AXSearchField", "AXTextArea", "AXComboBox"].contains(role) }
     var center: CGPoint { CGPoint(x: frame.midX, y: frame.midY) }
 
     /// Compact line Jev reads, e.g. "search field: Search".
-    var summary: String { "\(Self.friendly(role)): \(label)" }
+    var summary: String {
+        let base = "\(Self.friendly(role)): \(label)"
+        return context.isEmpty ? base : "\(base) (\(context))"
+    }
 
     static func friendly(_ role: String) -> String {
         switch role {
@@ -92,6 +97,7 @@ enum ScreenReader {
 
         let bounds = frame(of: window) ?? .infinite
         var out: [UIElement] = []
+        var headings: [(label: String, frame: CGRect)] = []
         var seen = Set<String>()
         var visited = 0
 
@@ -101,6 +107,11 @@ enum ScreenReader {
             let role = string(e, "AXRole")
             let actions = actionNames(e)
             let canPress = actions.contains("AXPress")
+
+            if role == "AXHeading", let f = frame(of: e), f.intersects(bounds) {
+                let text = self.label(for: e, role: role)
+                if !text.isEmpty { headings.append((String(text.prefix(60)), f)) }
+            }
 
             if interactiveRoles.contains(role) || canPress,
                let f = frame(of: e), f.width > 2, f.height > 2, f.intersects(bounds) {
@@ -118,7 +129,7 @@ enum ScreenReader {
             }
         }
         walk(window, depth: 0)
-        return (string(window, "AXTitle"), pruneDuplicates(out))
+        return (string(window, "AXTitle"), addContext(to: pruneDuplicates(out), headings: headings))
     }
 
     /// Adds screenshot text that Accessibility didn't already cover, then numbers everything.
@@ -128,7 +139,7 @@ enum ScreenReader {
             guard looksLikeIdentifier(e.label),
                   let shown = text.first(where: { e.frame.insetBy(dx: -2, dy: -2).contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY)) })
             else { return e }
-            return UIElement(id: e.id, role: e.role, label: "\(shown.text) (\(e.label))", frame: e.frame, ax: e.ax, canPress: e.canPress)
+            return UIElement(id: e.id, role: e.role, label: "\(shown.text) (\(e.label))", frame: e.frame, ax: e.ax, canPress: e.canPress, context: e.context)
         }
         for box in text where all.count < maxTotal {
             let center = CGPoint(x: box.frame.midX, y: box.frame.midY)
@@ -142,7 +153,7 @@ enum ScreenReader {
             }
         }
         return all.enumerated().map { i, e in
-            UIElement(id: "e\(i)", role: e.role, label: e.label, frame: e.frame, ax: e.ax, canPress: e.canPress)
+            UIElement(id: "e\(i)", role: e.role, label: e.label, frame: e.frame, ax: e.ax, canPress: e.canPress, context: e.context)
         }
     }
 
@@ -160,6 +171,35 @@ enum ScreenReader {
             }
         }
         return kept
+    }
+
+    /// Boards and lists repeat the same controls ("New page" in every column).
+    /// Label each element with the column header directly above it and the
+    /// nearest page heading above it, so Jev can tell them apart.
+    private static func addContext(to elements: [UIElement], headings: [(label: String, frame: CGRect)]) -> [UIElement] {
+        let headerRoles: Set<String> = ["AXMenuButton", "AXPopUpButton", "AXTab", "AXRadioButton"]
+        let headers = elements.filter { headerRoles.contains($0.role) && $0.label.count <= 40 }
+            .map { (label: $0.label, frame: $0.frame) } + headings
+
+        return elements.map { e in
+            // Column header: above this element, horizontally inside its span.
+            let column = headers
+                .filter { $0.frame.maxY <= e.frame.minY + 2 && $0.label != e.label
+                    && $0.frame.midX >= e.frame.minX - 12 && $0.frame.minX <= e.frame.maxX
+                    && e.frame.minY - $0.frame.maxY < 700 }
+                .min { e.frame.minY - $0.frame.maxY < e.frame.minY - $1.frame.maxY }
+            // Section heading: nearest heading above, anywhere across.
+            let section = headings
+                .filter { $0.frame.maxY <= e.frame.minY + 2 && $0.label != e.label && $0.label != column?.label }
+                .min { e.frame.minY - $0.frame.maxY < e.frame.minY - $1.frame.maxY }
+
+            var parts: [String] = []
+            if let column { parts.append("in \"\(column.label)\"") }
+            if let section { parts.append("under \"\(section.label)\"") }
+            var copy = e
+            copy.context = parts.joined(separator: ", ")
+            return copy
+        }
     }
 
     /// "ExportOkBtn", "automationcancel", "save_button": no spaces, reads like code.
