@@ -12,6 +12,7 @@ struct NotchView: View {
         case .idle: CGSize(width: notch.width + flare * 2, height: notch.height)
         case .listening: CGSize(width: 380, height: notch.height + rowHeight)
         case .thinking: CGSize(width: 320, height: notch.height + rowHeight)
+        case .working: CGSize(width: 400, height: notch.height + rowHeight)
         case .done, .failed: CGSize(width: 360, height: notch.height + rowHeight)
         }
     }
@@ -60,7 +61,8 @@ struct NotchView: View {
         switch state.phase {
         case .idle: ""
         case .listening: state.transcript.isEmpty ? "Listening…" : state.transcript
-        case .thinking: "Thinking…"
+        case .thinking: state.transcript.isEmpty ? "Thinking…" : state.transcript
+        case .working(let step): step
         case .done(let message), .failed(let message): message
         }
     }
@@ -69,7 +71,7 @@ struct NotchView: View {
         switch state.phase {
         case .listening:
             Waveform(level: state.level).frame(width: 64, height: 22)
-        case .thinking:
+        case .thinking, .working:
             ProgressView().controlSize(.small).tint(.white)
         case .done:
             Image(systemName: "checkmark.circle.fill")
@@ -122,6 +124,7 @@ struct Orb: View {
         switch phase {
         case .listening: [.cyan, .blue, .mint, .cyan]
         case .thinking: [.purple, .pink, .indigo, .purple]
+        case .working: [.blue, .purple, .cyan, .blue]
         case .done: [.green, .mint, .teal, .green]
         case .failed: [.red, .orange, .pink, .red]
         case .idle: [.gray, .gray]
@@ -131,7 +134,8 @@ struct Orb: View {
     var body: some View {
         TimelineView(.animation) { context in
             let t = context.date.timeIntervalSinceReferenceDate
-            let speed: Double = phase == .thinking ? 3 : 1.2
+            let busy: Bool = { if case .working = phase { return true }; return phase == .thinking }()
+            let speed: Double = busy ? 3 : 1.2
             let pulse = phase == .listening ? 1 + 0.08 * sin(t * 5) : 1
             Circle()
                 .fill(AngularGradient(colors: colors, center: .center,

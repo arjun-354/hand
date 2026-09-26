@@ -31,7 +31,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - --identifier com.arjun.hand "$APP"
+# A real identity keeps the code signature stable across rebuilds, so macOS
+# remembers Accessibility/Microphone grants. Falls back to ad-hoc signing.
+IDENTITY="$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development|Developer ID/ {print $2; exit}')"
+codesign --force --sign "${IDENTITY:--}" --identifier com.arjun.hand "$APP"
+echo "Signed with: ${IDENTITY:-ad-hoc}"
 echo "Built $APP"
 
 if [[ "${1:-}" == "--run" ]]; then

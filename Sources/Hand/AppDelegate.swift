@@ -29,7 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in self?.panel?.place(on: NotchPanel.targetScreen()) }
         }
 
-        if CommandLine.arguments.contains("--demo") { runDemo() }
+        handleDebugArguments()
     }
 
     /// Small menu bar icon so there's a way to quit and replay the animation.
@@ -59,4 +59,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func runDemo() { state.playDemo() }
+
+    /// --demo: play the animation. --say "text": run a command as if spoken.
+    /// --axdump <bundle-id>: write what Hand can see in that app to ~/Library/Logs/Hand/axdump.txt.
+    private func handleDebugArguments() {
+        let args = CommandLine.arguments
+        if args.contains("--demo") { runDemo() }
+        if let i = args.firstIndex(of: "--say"), i + 1 < args.count {
+            let text = args[i + 1]
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1))
+                await state.run(text)
+            }
+        }
+        if let i = args.firstIndex(of: "--axdump"), i + 1 < args.count {
+            let bundleID = args[i + 1]
+            Task { @MainActor in
+                guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
+                    Log.write("\(bundleID) is not running", to: "axdump.txt"); return
+                }
+                let screen = await ScreenReader.snapshot(of: app)
+                let lines = ["trusted: \(AXIsProcessTrusted())", "\(screen.appName) — \(screen.windowTitle) — \(screen.elements.count) elements"]
+                    + screen.elements.map { "\($0.id): \($0.summary)  @\(Int($0.frame.midX)),\(Int($0.frame.midY))" }
+                Log.write(lines.joined(separator: "\n"), to: "axdump.txt")
+            }
+        }
+    }
 }

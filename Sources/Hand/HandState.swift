@@ -1,10 +1,11 @@
-import Foundation
+import AppKit
 import Observation
 
 enum Phase: Equatable {
     case idle
     case listening
     case thinking
+    case working(String)
     case done(String)
     case failed(String)
 }
@@ -19,18 +20,20 @@ final class HandState {
     var level: Double = 0
 
     @ObservationIgnored private let speech = SpeechListener()
-    @ObservationIgnored private var apps = AppCatalog.scan()
+    @ObservationIgnored let pointer = Pointer()
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var permissionsOK = false
 
     init() {
         speech.onPartial = { [weak self] in self?.transcript = $0 }
         speech.onLevel = { [weak self] in self?.level = $0 }
-        log("\(apps.count) apps, jev \(JevClient.fromConfig() == nil ? "not configured (using local matcher)" : "configured")")
+        log("started: \(AppCatalog.scan().count) apps, jev \(JevClient.fromConfig() == nil ? "NOT configured" : "configured"), accessibility \(AXIsProcessTrusted())")
     }
 
+    /// Pressing the talk key also cancels whatever Hand was doing.
     func startListening() {
         task?.cancel()
+        pointer.hide()
         transcript = ""
         level = 0
         phase = .listening
@@ -55,24 +58,37 @@ final class HandState {
             transcript = text
             log("heard: \(text)")
             guard !text.isEmpty else { finish(.failed("Didn't hear anything")); return }
+            await run(text)
+        }
+    }
 
-            // Rescan apps and reread the key each time, so installs and key changes apply without a restart.
-            apps = AppCatalog.scan()
-            let brain = Brain(jev: JevClient.fromConfig(), apps: apps)
-            do {
-                let command = try await brain.decide(text)
-                finish(await Actions.run(command))
-            } catch {
-                log("brain error: \(error)")
-                finish(.failed("\(error)"))
-            }
+    /// Runs a command as if it had been spoken. Used by voice and by `--say`.
+    func run(_ text: String) async {
+        guard let jev = JevClient.fromConfig() else {
+            finish(.failed("Add your TypeSafe key to ~/.config/hand/.env")); return
+        }
+        phase = .thinking
+        transcript = text
+        let agent = Agent(jev: jev, apps: AppCatalog.scan(), pointer: pointer) { [weak self] step in
+            self?.phase = .working(step)
+        }
+        do {
+            let result = try await agent.run(text)
+            log("result: \(result)")
+            finish(result)
+        } catch is CancellationError {
+            pointer.hide()
+        } catch {
+            log("agent error: \(error)")
+            pointer.hide()
+            finish(.failed("\(error)"))
         }
     }
 
     func finish(_ result: Phase) {
         phase = result
         task = Task {
-            try? await Task.sleep(for: .seconds(2.2))
+            try? await Task.sleep(for: .seconds(2.5))
             guard !Task.isCancelled else { return }
             phase = .idle
         }
