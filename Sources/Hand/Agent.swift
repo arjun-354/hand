@@ -9,6 +9,8 @@ final class Agent {
     let onStep: (String) -> Void
     /// Screen read taken when the talk key went down.
     let prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)?
+    /// What was on screen when the talk key went down ("this").
+    let source: SourceContext
     /// Apps already relaunched for accessibility this session; never do it twice.
     private static var relaunchedApps: Set<String> = []
 
@@ -18,7 +20,9 @@ final class Agent {
 
     init(jev: JevClient, apps: [InstalledApp],
          prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)? = nil,
+         source: SourceContext = SourceContext(),
          onStep: @escaping (String) -> Void) {
+        self.source = source
         self.jev = jev
         self.apps = apps
         self.prefetched = prefetched
@@ -36,7 +40,8 @@ final class Agent {
         for app in apps.prefix(250) { appOptions[app.name] = NSNull() }
 
         let route = try await jev.ask(
-            state: ["spoken_request": goal, "frontmost_app": front?.localizedName ?? ""],
+            state: ["spoken_request": goal, "frontmost_app": front?.localizedName ?? "",
+                    "user_was_looking_at": source.summary],
             questions: [
                 "intent": [
                     "type": "choice",
@@ -118,6 +123,7 @@ final class Agent {
                 "app": screen.appName,
                 "window": screen.windowTitle,
                 "steps_done": history.isEmpty ? ["nothing yet"] : history,
+                "user_was_looking_at": source.summary,
                 "screen": screen.elements.map { "\($0.id): \($0.summary)" },
             ], questions: questions(for: screen, spans: spans))
 
@@ -203,6 +209,7 @@ final class Agent {
 
         var texts: [String: Any] = [:]
         for s in spans { texts[s] = NSNull() }
+        for (value, meaning) in source.typeableValues { texts[value] = meaning }
 
         return [
             "done": [
@@ -215,7 +222,7 @@ final class Agent {
                 "instructions": "What is the single best next step toward the `goal`, given `steps_done` and what is on `screen`?",
                 "criteria": [
                     "click": "Click an item on screen: a button, list item, link, tab, sidebar entry, or search result",
-                    "type": "Type text into a search box or text field that doesn't already contain it. Only when the goal asks to search for, play, find, write, or type something specific",
+                    "type": "Type or paste text into a search box, text field, title, or page that doesn't already contain it. Only when the goal asks to search for, play, find, write, add, or save something specific",
                     "submit": "Press Return to submit text that was just typed",
                 ],
             ],
@@ -231,7 +238,7 @@ final class Agent {
             ],
             "text": [
                 "type": "choice",
-                "instructions": "Which words from the `goal` should be typed into a search box to find what the user wants? Leave out the app name and command words like play, open, search.",
+                "instructions": "What should be typed to move toward the `goal`? Either words from the `goal` (leave out the app name and command words like play, open, search), or, when the goal refers to 'this', 'the link', or what the user was looking at, the matching value from `user_was_looking_at`.",
                 "criteria": texts,
             ],
         ]

@@ -10,7 +10,8 @@ Decisions are made by [TypeSafe's Jev](https://docs.typesafe.ai), a System One m
 2. **Route** — one Jev call: what kind of request (open / quit / operate / other) and which installed app (`Agent`).
 3. **See** — the front window is read through the Accessibility API and flattened into a labelled list like `e5: search field: What do you want to play?` (`ScreenReader`).
 4. **Decide** — one Jev call per step asks in parallel: is the goal done, click/type/submit, which element, which field, and which words from the request to type.
-5. **Act** — a glowing pointer glides to the element, then Hand clicks or pastes text (`Pointer`, `Input`). Loops up to 8 steps.
+5. **Remember "this"** — at key-down Hand also records the front app's link, title, selected text and clipboard, so "add the link to this reel to Notion" can paste the reel's URL after switching apps (`SourceContext`).
+6. **Act** — a glowing pointer glides to the element, then Hand clicks or pastes text (`Pointer`, `Input`). Loops up to 8 steps.
 
 The notch UI (`NotchView`, `NotchWindow`) drops out of the camera housing and shows each step live.
 
@@ -37,6 +38,7 @@ Logs go to `~/Library/Logs/Hand/` — `hand.log` for every run, `last-screen.txt
 open build/Hand.app --args --say "open storage in settings"   # run a command without speaking
 open build/Hand.app --args --axdump com.spotify.client        # what Hand can see in an app
 open build/Hand.app --args --axtree com.spotify.client        # raw accessibility tree
+open build/Hand.app --args --context com.google.Chrome        # what "this" would mean in an app
 open build/Hand.app --args --demo                             # notch animation only
 ```
 
