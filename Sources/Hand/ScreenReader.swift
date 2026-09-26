@@ -188,9 +188,11 @@ enum ScreenReader {
                     && $0.frame.midX >= e.frame.minX - 12 && $0.frame.minX <= e.frame.maxX
                     && e.frame.minY - $0.frame.maxY < 700 }
                 .min { e.frame.minY - $0.frame.maxY < e.frame.minY - $1.frame.maxY }
-            // Section heading: nearest heading above, anywhere across.
+            // Section heading: nearest heading above that shares some horizontal space
+            // (so a sidebar isn't labelled with the main pane's headings).
             let section = headings
-                .filter { $0.frame.maxY <= e.frame.minY + 2 && $0.label != e.label && $0.label != column?.label }
+                .filter { $0.frame.maxY <= e.frame.minY + 2 && $0.label != e.label && $0.label != column?.label
+                    && $0.frame.minX < e.frame.maxX && $0.frame.maxX > e.frame.minX }
                 .min { e.frame.minY - $0.frame.maxY < e.frame.minY - $1.frame.maxY }
 
             var parts: [String] = []
@@ -204,7 +206,7 @@ enum ScreenReader {
 
     /// "ExportOkBtn", "automationcancel", "save_button": no spaces, reads like code.
     private static func looksLikeIdentifier(_ label: String) -> Bool {
-        guard !label.contains(" "), label.count > 3 else { return false }
+        guard label.count > 3, label.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }) else { return false }
         let hasInnerCapital = label.dropFirst().contains(where: \.isUppercase)
         return hasInnerCapital || label.contains("_") || label == label.lowercased()
     }

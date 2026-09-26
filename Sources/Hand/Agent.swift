@@ -176,6 +176,12 @@ final class Agent {
                 guard stepKey != lastStep else {
                     return .done(history.last ?? "Done")
                 }
+                // Screenshot positions can go stale; never click outside the app.
+                if element.ax == nil, !Self.isInside(element.center, windowsOf: app) {
+                    log("  \(element.label) @\(Int(element.center.x)),\(Int(element.center.y)) is outside \(screen.appName)'s windows; looking again")
+                    try await Task.sleep(for: .seconds(0.4))
+                    continue
+                }
                 onStep("Clicking \(element.label)")
                 Input.click(element)
                 history.append("Clicked \(element.summary)")
@@ -267,8 +273,8 @@ final class Agent {
         for _ in 0..<40 {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier == running.processIdentifier {
                 let root = AXUIElementCreateApplication(running.processIdentifier)
-                if let windows = ScreenReader.attr(root, "AXWindows") as? [AXUIElement], !windows.isEmpty {
-                    try? await Task.sleep(for: .seconds(0.4))
+                if let windows = ScreenReader.attr(root, "AXWindows") as? [AXUIElement], let window = windows.first {
+                    await waitUntilStill(window)
                     return true
                 }
             }
@@ -289,6 +295,25 @@ final class Agent {
         if element.role == "AXTextArea" { return true }
         let l = element.label.lowercased()
         return ["message", "reply", "chat", "write", "ask", "compose", "prompt", "type a", "how can i help"].contains { l.contains($0) }
+    }
+
+    /// Windows animate open; screenshot positions are wrong until they stop moving.
+    private func waitUntilStill(_ window: AXUIElement) async {
+        var last = ScreenReader.frame(of: window)
+        for _ in 0..<15 {
+            try? await Task.sleep(for: .seconds(0.15))
+            let now = ScreenReader.frame(of: window)
+            if now == last { break }
+            last = now
+        }
+        try? await Task.sleep(for: .seconds(0.2))
+    }
+
+    /// True when `point` lands on one of `app`'s windows, so a click can't hit another app.
+    static func isInside(_ point: CGPoint, windowsOf app: NSRunningApplication) -> Bool {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        let windows = (ScreenReader.attr(root, "AXWindows") as? [AXUIElement]) ?? []
+        return windows.contains { ScreenReader.frame(of: $0)?.contains(point) ?? false }
     }
 
     /// Every run of 1–6 consecutive words, so Jev can pick the part to type.

@@ -18,32 +18,44 @@ enum ScreenVision {
     @discardableResult
     static func requestPermission() -> Bool { CGRequestScreenCaptureAccess() }
 
-    /// Screenshots only `pid`'s windows on the display it's using and reads the text.
+    /// Screenshots each of `pid`'s visible windows (main window, dialogs, dropdowns)
+    /// and reads the text on them.
     static func readText(pid: pid_t) async -> [TextBox] {
         guard hasPermission else { return [] }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-            guard let app = content.applications.first(where: { $0.processID == pid }) else { return [] }
-            let windows = content.windows.filter { $0.owningApplication?.processID == pid && $0.frame.width > 40 }
-            guard let biggest = windows.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }),
-                  let display = content.displays.first(where: { $0.frame.intersects(biggest.frame) }) ?? content.displays.first
-            else { return [] }
+            let windows = content.windows
+                .filter { $0.owningApplication?.processID == pid && $0.frame.width > 40 && $0.frame.height > 20 }
+                .sorted { $0.windowLayer > $1.windowLayer }
+                .prefix(4)
+            guard !windows.isEmpty else {
+                log("vision: no visible windows for \(pid)"); return []
+            }
 
-            let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
-            let config = SCStreamConfiguration()
-            let scale = NSScreen.screens.first { $0.displayID == display.displayID }?.backingScaleFactor ?? 2
-            config.width = Int(display.frame.width * scale)
-            config.height = Int(display.frame.height * scale)
-            config.showsCursor = false
-            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            return try recognize(image, in: display.frame)
+            var boxes: [TextBox] = []
+            for window in windows {
+                // A single-window capture shows exactly `window.frame` (global points, top-left origin).
+                let filter = SCContentFilter(desktopIndependentWindow: window)
+                let scale = CGFloat(filter.pointPixelScale)
+                let config = SCStreamConfiguration()
+                config.width = Int(window.frame.width * scale)
+                config.height = Int(window.frame.height * scale)
+                config.showsCursor = false
+                config.ignoreShadowsSingleWindow = true
+                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                if window == windows.first { saveForDebugging(image) }
+                boxes += try recognize(image, covering: window.frame)
+            }
+            log("vision: \(windows.count) window(s) \(windows.map { "\($0.frame)" }.joined(separator: " ")) -> \(boxes.count) text boxes")
+            return boxes
         } catch {
             log("vision error: \(error)")
             return []
         }
     }
 
-    private static func recognize(_ image: CGImage, in displayFrame: CGRect) throws -> [TextBox] {
+    /// `area` is the on-screen rectangle (global points) the image shows.
+    private static func recognize(_ image: CGImage, covering area: CGRect) throws -> [TextBox] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false  // UI labels like "4K", "60fps", "H.264" aren't dictionary words
@@ -56,13 +68,21 @@ enum ScreenVision {
             // Vision boxes are normalized with a bottom-left origin.
             let box = obs.boundingBox
             let frame = CGRect(
-                x: displayFrame.minX + box.minX * displayFrame.width,
-                y: displayFrame.minY + (1 - box.maxY) * displayFrame.height,
-                width: box.width * displayFrame.width,
-                height: box.height * displayFrame.height
+                x: area.minX + box.minX * area.width,
+                y: area.minY + (1 - box.maxY) * area.height,
+                width: box.width * area.width,
+                height: box.height * area.height
             )
             return TextBox(text: text, frame: frame)
         }
+    }
+
+    /// Keeps the latest capture at ~/Library/Logs/Hand/last-capture.png for debugging.
+    private static func saveForDebugging(_ image: CGImage) {
+        let url = Log.dir.appendingPathComponent("last-capture.png")
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dest, image, nil)
+        CGImageDestinationFinalize(dest)
     }
 
     /// Loads the text model at launch so the first real read is fast.
