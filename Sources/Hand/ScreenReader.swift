@@ -2,7 +2,7 @@ import AppKit
 import ApplicationServices
 
 /// One thing on screen Hand can act on.
-struct UIElement {
+struct UIElement: @unchecked Sendable {  // AXUIElement refs are safe to pass between threads
     let id: String
     let role: String
     let label: String
@@ -58,11 +58,11 @@ struct ScreenSnapshot {
 @MainActor
 enum ScreenReader {
     /// Jev accepts up to 255 options per choice; leave room for vision results.
-    static let maxElements = 180
-    static let maxTotal = 250
+    nonisolated static let maxElements = 180
+    nonisolated static let maxTotal = 250
     private static var enhanced: Set<pid_t> = []
 
-    private static let interactiveRoles: Set<String> = [
+    nonisolated private static let interactiveRoles: Set<String> = [
         "AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXLink",
         "AXTextField", "AXSearchField", "AXTextArea", "AXComboBox", "AXRow", "AXOutlineRow",
         "AXCell", "AXTab", "AXDisclosureTriangle", "AXSlider",
@@ -71,24 +71,40 @@ enum ScreenReader {
     /// Everything Hand can see in `app`: its accessibility tree merged with the
     /// text in a screenshot of its windows (read in parallel).
     static func snapshot(of app: NSRunningApplication) async -> ScreenSnapshot {
-        async let seen = ScreenVision.readText(pid: app.processIdentifier)
-        let (title, axElements) = await accessibilityElements(of: app)
-        let merged = merge(axElements, with: await seen)
-        return ScreenSnapshot(appName: app.localizedName ?? "", windowTitle: title, elements: merged)
-    }
-
-    private static func accessibilityElements(of app: NSRunningApplication) async -> (String, [UIElement]) {
-        let root = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(root, 1.5)
+        let started = Date()
+        let pid = app.processIdentifier
+        async let seen = ScreenVision.readText(pid: pid)
 
         // Chromium/Electron apps (Spotify, Slack, Chrome, VS Code…) only build their
         // accessibility tree once asked. Give them a moment the first time.
-        if !enhanced.contains(app.processIdentifier) {
+        if !enhanced.contains(pid) {
+            let root = AXUIElementCreateApplication(pid)
             AXUIElementSetAttributeValue(root, "AXManualAccessibility" as CFString, kCFBooleanTrue)
             AXUIElementSetAttributeValue(root, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-            enhanced.insert(app.processIdentifier)
+            enhanced.insert(pid)
             try? await Task.sleep(for: .seconds(0.8))
         }
+
+        // Walking the tree is thousands of cross-process calls; off the main thread
+        // so the notch and speech recognition never freeze.
+        let (title, axElements) = await Task.detached(priority: .userInitiated) {
+            accessibilityElements(pid: pid)
+        }.value
+        let axTime = Date().timeIntervalSince(started)
+        let text = await seen
+        let merged = merge(axElements, with: text)
+        log(String(format: "screen read: %d accessibility + %d text in %.1fs (tree %.1fs)",
+                   axElements.count, text.count, Date().timeIntervalSince(started), axTime))
+        return ScreenSnapshot(appName: app.localizedName ?? "", windowTitle: title, elements: merged)
+    }
+
+    /// Time budget for one tree walk; slow apps get a partial but usable list.
+    nonisolated static let walkBudget: TimeInterval = 1.5
+
+    nonisolated private static func accessibilityElements(pid: pid_t) -> (String, [UIElement]) {
+        let root = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(root, 0.5)
+        let deadline = Date().addingTimeInterval(walkBudget)
 
         let focused = element(root, "AXFocusedWindow") ?? element(root, "AXMainWindow")
         // Some apps split one window into several (full-screen Chrome: tab strip,
@@ -106,7 +122,7 @@ enum ScreenReader {
         var bounds = CGRect.infinite  // the window currently being walked
 
         func walk(_ e: AXUIElement, depth: Int) {
-            guard depth < 60, visited < 6000, out.count < maxElements else { return }
+            guard depth < 60, visited < 4000, out.count < maxElements, Date() < deadline else { return }
             visited += 1
             let role = string(e, "AXRole")
             let actions = actionNames(e)
@@ -132,7 +148,7 @@ enum ScreenReader {
                 walk(child, depth: depth + 1)
             }
         }
-        for w in windows.prefix(5) {
+        for w in windows.prefix(4) where Date() < deadline {
             bounds = frame(of: w) ?? .infinite
             walk(w, depth: 0)
         }
@@ -140,7 +156,7 @@ enum ScreenReader {
     }
 
     /// Adds screenshot text that Accessibility didn't already cover, then numbers everything.
-    private static func merge(_ ax: [UIElement], with text: [ScreenVision.TextBox]) -> [UIElement] {
+    nonisolated private static func merge(_ ax: [UIElement], with text: [ScreenVision.TextBox]) -> [UIElement] {
         // Qt apps label buttons with code names ("ExportOkBtn"); prefer the words drawn on them.
         var all = ax.map { e -> UIElement in
             guard looksLikeIdentifier(e.label),
@@ -166,7 +182,7 @@ enum ScreenReader {
 
     /// Web apps nest a row, its text and its button at the same spot. Keep the
     /// most descriptive one and renumber so ids stay compact.
-    private static func pruneDuplicates(_ elements: [UIElement]) -> [UIElement] {
+    nonisolated private static func pruneDuplicates(_ elements: [UIElement]) -> [UIElement] {
         let kept = elements.filter { e in
             if e.label == "•" { return false }
             return !elements.contains { other in
@@ -183,7 +199,7 @@ enum ScreenReader {
     /// Boards and lists repeat the same controls ("New page" in every column).
     /// Label each element with the column header directly above it and the
     /// nearest page heading above it, so Jev can tell them apart.
-    private static func addContext(to elements: [UIElement], headings: [(label: String, frame: CGRect)]) -> [UIElement] {
+    nonisolated private static func addContext(to elements: [UIElement], headings: [(label: String, frame: CGRect)]) -> [UIElement] {
         let headerRoles: Set<String> = ["AXMenuButton", "AXPopUpButton", "AXTab", "AXRadioButton"]
         let headers = elements.filter { headerRoles.contains($0.role) && $0.label.count <= 40 }
             .map { (label: $0.label, frame: $0.frame) } + headings
@@ -212,7 +228,7 @@ enum ScreenReader {
     }
 
     /// "ExportOkBtn", "automationcancel", "save_button": no spaces, reads like code.
-    private static func looksLikeIdentifier(_ label: String) -> Bool {
+    nonisolated private static func looksLikeIdentifier(_ label: String) -> Bool {
         guard label.count > 3, label.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }) else { return false }
         let hasInnerCapital = label.dropFirst().contains(where: \.isUppercase)
         return hasInnerCapital || label.contains("_") || label == label.lowercased()
@@ -249,7 +265,7 @@ enum ScreenReader {
         return CGRect(origin: pos, size: size)
     }
 
-    private static func label(for e: AXUIElement, role: String) -> String {
+    nonisolated private static func label(for e: AXUIElement, role: String) -> String {
         var parts = [string(e, "AXTitle"), string(e, "AXDescription")]
         if ["AXTextField", "AXSearchField", "AXTextArea", "AXComboBox"].contains(role) {
             parts.append(string(e, "AXPlaceholderValue"))
@@ -271,7 +287,7 @@ enum ScreenReader {
         return String(label.prefix(120))
     }
 
-    private static func descendantTexts(_ e: AXUIElement, limit: Int, depth: Int = 0) -> [String] {
+    nonisolated private static func descendantTexts(_ e: AXUIElement, limit: Int, depth: Int = 0) -> [String] {
         guard depth < 5 else { return [] }
         var out: [String] = []
         for child in (attr(e, "AXChildren") as? [AXUIElement]) ?? [] {

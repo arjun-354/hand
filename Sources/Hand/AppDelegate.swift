@@ -83,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let i = args.firstIndex(of: "--context"), i + 1 < args.count,
            let app = NSRunningApplication.runningApplications(withBundleIdentifier: args[i + 1]).first {
-            let ctx = SourceContext.capture(from: app)
+            let ctx = SourceContext.capture(pid: app.processIdentifier, appName: app.localizedName ?? "")
             Log.write("app: \(ctx.appName)\ntitle: \(ctx.windowTitle)\nlink: \(ctx.link)\nselected: \(ctx.selectedText)\nclipboard: \(ctx.clipboard.prefix(80))",
                       to: "context.txt")
         }

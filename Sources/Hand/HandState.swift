@@ -25,7 +25,7 @@ final class HandState {
     /// Screen read started the moment the talk key goes down, so it's ready when you stop talking.
     @ObservationIgnored private var prefetch: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)?
     /// Link, title, selection and clipboard from the app in front at key-down.
-    @ObservationIgnored private var source: SourceContext?
+    @ObservationIgnored private var source: Task<SourceContext, Never>?
 
     init() {
         speech.onPartial = { [weak self] in self?.transcript = $0 }
@@ -43,7 +43,8 @@ final class HandState {
         phase = .listening
         if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() {
             prefetch = (front.processIdentifier, Task { await ScreenReader.snapshot(of: front) })
-            source = SourceContext.capture(from: front)
+            let pid = front.processIdentifier, name = front.localizedName ?? ""
+            source = Task.detached { SourceContext.capture(pid: pid, appName: name) }
         }
         task = Task {
             if !permissionsOK {
@@ -79,10 +80,11 @@ final class HandState {
         transcript = text
         let seen = prefetch
         prefetch = nil
-        var looking = source ?? SourceContext()
+        var looking = await source?.value ?? SourceContext()
         source = nil
         if looking.appName.isEmpty, let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() {
-            looking = SourceContext.capture(from: front)  // --say runs have no key-down
+            let pid = front.processIdentifier, name = front.localizedName ?? ""
+            looking = await Task.detached { SourceContext.capture(pid: pid, appName: name) }.value  // --say runs have no key-down
         }
         log("looking at: \(looking.appName) \"\(looking.windowTitle)\" link=\(looking.link.isEmpty ? "-" : looking.link)")
         let agent = Agent(jev: jev, apps: AppCatalog.scan(), prefetched: seen, source: looking) { [weak self] step in

@@ -27,13 +27,13 @@ struct SourceContext {
          "selected_text": String(selectedText.prefix(200))].filter { !$0.value.isEmpty }
     }
 
-    @MainActor
-    static func capture(from app: NSRunningApplication) -> SourceContext {
-        var ctx = SourceContext(appName: app.localizedName ?? "")
+    /// Safe to call off the main thread.
+    static func capture(pid: pid_t, appName: String) -> SourceContext {
+        var ctx = SourceContext(appName: appName)
         ctx.clipboard = NSPasteboard.general.string(forType: .string)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-        let root = AXUIElementCreateApplication(app.processIdentifier)
+        let root = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(root, 0.5)
         if let focused = ScreenReader.element(root, "AXFocusedUIElement") {
             ctx.selectedText = ScreenReader.string(focused, "AXSelectedText")
@@ -46,7 +46,6 @@ struct SourceContext {
     }
 
     /// Browsers expose the page URL on their web area; document apps on the window.
-    @MainActor
     private static func findLink(in window: AXUIElement) -> String {
         if let doc = urlString(ScreenReader.attr(window, "AXDocument")) { return doc }
         var visited = 0
