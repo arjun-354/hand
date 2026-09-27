@@ -90,16 +90,20 @@ enum ScreenReader {
             try? await Task.sleep(for: .seconds(0.8))
         }
 
-        let window = element(root, "AXFocusedWindow")
-            ?? element(root, "AXMainWindow")
-            ?? ((attr(root, "AXWindows") as? [AXUIElement])?.first)
-        guard let window else { return ("", []) }
-
-        let bounds = frame(of: window) ?? .infinite
+        let focused = element(root, "AXFocusedWindow") ?? element(root, "AXMainWindow")
+        // Some apps split one window into several (full-screen Chrome: tab strip,
+        // toolbar and page are separate windows), so read every visible one.
+        var windows = (attr(root, "AXWindows") as? [AXUIElement]) ?? []
+        windows = windows.filter { ScreenReader.frame(of: $0).map { $0.width > 40 && $0.height > 20 } ?? false
+            && (attr($0, "AXMinimized") as? Bool) != true }
+        if let focused { windows.removeAll { CFEqual($0, focused) }; windows.insert(focused, at: 0) }
+        guard let window = windows.first else { return ("", []) }
+        let screenBounds = NSScreen.screens.map(\.frame).reduce(CGRect.null) { $0.union($1) }
         var out: [UIElement] = []
         var headings: [(label: String, frame: CGRect)] = []
         var seen = Set<String>()
         var visited = 0
+        var bounds = CGRect.infinite  // the window currently being walked
 
         func walk(_ e: AXUIElement, depth: Int) {
             guard depth < 60, visited < 6000, out.count < maxElements else { return }
@@ -114,7 +118,7 @@ enum ScreenReader {
             }
 
             if interactiveRoles.contains(role) || canPress,
-               let f = frame(of: e), f.width > 2, f.height > 2, f.intersects(bounds) {
+               let f = frame(of: e), f.width > 2, f.height > 2, f.intersects(bounds), f.intersects(screenBounds) {
                 let label = self.label(for: e, role: role)
                 if !label.isEmpty {
                     let key = "\(label)|\(Int(f.midX / 8))|\(Int(f.midY / 8))"
@@ -128,7 +132,10 @@ enum ScreenReader {
                 walk(child, depth: depth + 1)
             }
         }
-        walk(window, depth: 0)
+        for w in windows.prefix(5) {
+            bounds = frame(of: w) ?? .infinite
+            walk(w, depth: 0)
+        }
         return (string(window, "AXTitle"), addContext(to: pruneDuplicates(out), headings: headings))
     }
 

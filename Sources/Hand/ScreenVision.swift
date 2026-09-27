@@ -18,35 +18,38 @@ enum ScreenVision {
     @discardableResult
     static func requestPermission() -> Bool { CGRequestScreenCaptureAccess() }
 
-    /// Screenshots each of `pid`'s visible windows (main window, dialogs, dropdowns)
-    /// and reads the text on them.
+    /// Screenshots the whole display (always 1:1 with screen coordinates, unlike
+    /// per-app or per-window captures, which crop and rescale) and keeps the text
+    /// that falls inside `pid`'s windows. What's on top is what's clickable.
     static func readText(pid: pid_t) async -> [TextBox] {
         guard hasPermission else { return [] }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-            let windows = content.windows
+            let appWindows = content.windows
                 .filter { $0.owningApplication?.processID == pid && $0.frame.width > 40 && $0.frame.height > 20 }
-                .sorted { $0.windowLayer > $1.windowLayer }
-                .prefix(4)
-            guard !windows.isEmpty else {
+                .map(\.frame)
+            guard let anchor = appWindows.max(by: { $0.width * $0.height < $1.width * $1.height }),
+                  let display = content.displays.first(where: { $0.frame.intersects(anchor) }) ?? content.displays.first
+            else {
                 log("vision: no visible windows for \(pid)"); return []
             }
 
-            var boxes: [TextBox] = []
-            for window in windows {
-                // A single-window capture shows exactly `window.frame` (global points, top-left origin).
-                let filter = SCContentFilter(desktopIndependentWindow: window)
-                let scale = CGFloat(filter.pointPixelScale)
-                let config = SCStreamConfiguration()
-                config.width = Int(window.frame.width * scale)
-                config.height = Int(window.frame.height * scale)
-                config.showsCursor = false
-                config.ignoreShadowsSingleWindow = true
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                if window == windows.first { saveForDebugging(image) }
-                boxes += try recognize(image, covering: window.frame)
+            // Leave Hand's own notch out of the picture.
+            let own = content.windows.filter { $0.owningApplication?.processID == getpid() }
+            let filter = SCContentFilter(display: display, excludingWindows: own)
+            let scale = NSScreen.screens.first { $0.displayID == display.displayID }?.backingScaleFactor ?? 2
+            let config = SCStreamConfiguration()
+            config.width = Int(display.frame.width * scale)
+            config.height = Int(display.frame.height * scale)
+            config.showsCursor = false
+            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            saveForDebugging(image)
+
+            let boxes = try recognize(image, covering: display.frame).filter { box in
+                let center = CGPoint(x: box.frame.midX, y: box.frame.midY)
+                return appWindows.contains { $0.contains(center) }
             }
-            log("vision: \(windows.count) window(s) \(windows.map { "\($0.frame)" }.joined(separator: " ")) -> \(boxes.count) text boxes")
+            log("vision: display \(display.frame), \(appWindows.count) app window(s) -> \(boxes.count) text boxes")
             return boxes
         } catch {
             log("vision error: \(error)")
