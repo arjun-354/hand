@@ -40,6 +40,8 @@ echo "Built $APP"
 
 if [[ "${1:-}" == "--run" ]]; then
     pkill -x Hand 2>/dev/null || true
+    # Opening before the old copy has fully exited fails with error -600.
+    for _ in {1..50}; do pgrep -x Hand >/dev/null || break; sleep 0.1; done
     shift
     open "$APP" --args "$@"
 fi
