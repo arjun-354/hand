@@ -1,14 +1,33 @@
 import Foundation
 
-/// The slow, smart half of Hand, backed by Meta's Model API (Muse Spark,
-/// OpenAI-compatible chat completions). Plans multi-step tasks, writes text, answers
-/// questions and looks at images. Jev still makes every per-step decision.
+/// The slow, smart half of Hand: plans multi-step tasks, writes text, answers questions
+/// and looks at images. Jev still makes every per-step decision. Both providers speak
+/// OpenAI-style chat completions.
+///  - Groq (default): gpt-oss for text, Qwen for images. Free plan: 1K requests/day and
+///    8K tokens/minute per model, so prompts stay small and a busy model falls back.
+///  - Meta Model API (paused; BRAIN_PROVIDER=meta): Muse Spark, needs billing set up.
 struct Brain {
+    enum Provider: String { case groq, meta }
+
+    let provider: Provider
     let apiKey: String
-    /// muse-spark-1.3 is Meta's recommended model and reads images. The "-contributor"
-    /// variants are cheaper but Meta may train on what's sent, which here includes screen text.
-    var model = Config.value("META_MODEL") ?? "muse-spark-1.3"
-    private static let endpoint = URL(string: "https://api.meta.ai/v1/chat/completions")!
+
+    private var endpoint: URL {
+        switch provider {
+        case .groq: URL(string: "https://api.groq.com/openai/v1/chat/completions")!
+        case .meta: URL(string: "https://api.meta.ai/v1/chat/completions")!
+        }
+    }
+
+    /// Models to try in order. Each Groq model has its own rate limit, so a fallback helps.
+    private func models(forImage: Bool) -> [String] {
+        if let pinned = Config.value(provider == .groq ? "GROQ_MODEL" : "META_MODEL"), !forImage { return [pinned] }
+        switch provider {
+        case .groq: return forImage ? ["qwen/qwen3.8-27b"] : ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+        // The "-contributor" variants are cheaper but Meta may train on what's sent (screen text).
+        case .meta: return ["muse-spark-1.3"]
+        }
+    }
 
     struct Plan: Decodable {
         var steps: [String] = []
@@ -31,16 +50,21 @@ struct Brain {
         case http(Int, String), empty
         var description: String {
             switch self {
-            case .http(401, _): "Meta rejected the API key"
-            case .http(429, _): "Meta rate limit hit"
-            case .http(let code, let body): "Meta error \(code): \(body.prefix(200))"
-            case .empty: "Meta returned nothing"
+            case .http(401, _): "The Brain's API key was rejected"
+            case .http(429, _): "Brain rate limit hit"
+            case .http(let code, let body): "Brain error \(code): \(body.prefix(200))"
+            case .empty: "The Brain returned nothing"
             }
         }
     }
 
     static func fromConfig() -> Brain? {
-        (Config.value("META_API_KEY") ?? Config.value("MODEL_API_KEY")).map { Brain(apiKey: $0) }
+        let choice = Config.value("BRAIN_PROVIDER").flatMap(Provider.init(rawValue:))
+        if choice != .meta, let key = Config.value("GROQ_API_KEY") { return Brain(provider: .groq, apiKey: key) }
+        if choice == .meta, let key = Config.value("META_API_KEY") ?? Config.value("MODEL_API_KEY") {
+            return Brain(provider: .meta, apiKey: key)
+        }
+        return nil
     }
 
     // MARK: - What Hand asks
@@ -58,7 +82,7 @@ struct Brain {
         What the user was looking at when they spoke: \(lookingAt.isEmpty ? "unknown" : "\(lookingAt)")
         Steps already done: \(stepsDone.isEmpty ? "none" : stepsDone.joined(separator: "; "))
         Items on screen:
-        \(screen.prefix(180).joined(separator: "\n"))
+        \(screen.prefix(120).map { String($0.prefix(90)) }.joined(separator: "\n"))
 
         Rules:
         - At most 6 steps, starting from the current screen. Use the app's normal UI and keyboard-free actions.
@@ -83,8 +107,8 @@ struct Brain {
 
         User said (speech-to-text, may be misheard): "\(question)"
         App and page they're on: \(lookingAt.isEmpty ? "unknown" : "\(lookingAt)")
-        \(selectedText.isEmpty ? "No text is selected." : "Text they selected:\n\"\"\"\n\(selectedText.prefix(20_000))\n\"\"\"")
-        \(selectedText.isEmpty && !screenText.isEmpty ? "Text visible on their screen:\n\(screenText.prefix(250).joined(separator: "\n"))" : "")
+        \(selectedText.isEmpty ? "No text is selected." : "Text they selected:\n\"\"\"\n\(selectedText.prefix(12_000))\n\"\"\"")
+        \(selectedText.isEmpty && !screenText.isEmpty ? "Text visible on their screen:\n\(screenText.prefix(150).map { String($0.prefix(90)) }.joined(separator: "\n"))" : "")
         """
         let withImage = image == nil ? prompt : prompt + "\nThe attached image is the window they are looking at."
         return try await generate(withImage, json: false, image: image).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -108,33 +132,53 @@ struct Brain {
 
     // MARK: - API
 
-    /// One chat completion. Muse Spark always reasons; "low" keeps it quick.
+    /// One chat completion on the first model that isn't rate-limited.
     func generate(_ prompt: String, json: Bool = true, image: Data? = nil) async throws -> String {
         var content: [[String: Any]] = [["type": "text", "text": prompt]]
         if let image {
             content.insert(["type": "image_url",
-                            "image_url": ["url": "data:image/jpeg;base64,\(image.base64EncodedString())", "detail": "low"]], at: 0)
+                            "image_url": ["url": "data:image/jpeg;base64,\(image.base64EncodedString())"]], at: 0)
         }
-        var body: [String: Any] = [
-            "model": model,
-            "messages": [["role": "user", "content": content]],
-            "reasoning_effort": "low",
-            "max_completion_tokens": 4000,
-        ]
-        if json { body["response_format"] = ["type": "json_object"] }
+        var lastError: Error = Failure.empty
+        for model in models(forImage: image != nil) {
+            var body: [String: Any] = [
+                "model": model,
+                "messages": [["role": "user", "content": content]],
+                "max_completion_tokens": 2500,
+            ]
+            switch (provider, model.hasPrefix("qwen/")) {
+            case (.groq, true): body["reasoning_effort"] = "none"  // Qwen can skip reasoning entirely
+            case (.groq, false): body["reasoning_effort"] = "low"; body["include_reasoning"] = false
+            case (.meta, _): body["reasoning_effort"] = "low"      // Muse Spark always reasons
+            }
+            if json { body["response_format"] = ["type": "json_object"] }
+            do {
+                return try await send(body, model: model)
+            } catch Failure.http(let code, let text) where code == 429 || code >= 500 {
+                log("brain \(model) unavailable (\(code)); trying next")
+                lastError = Failure.http(code, text)
+            }
+        }
+        throw lastError
+    }
 
-        var request = URLRequest(url: Self.endpoint, timeoutInterval: 30)
+    private func send(_ body: [String: Any], model: String) async throws -> String {
+        var request = URLRequest(url: endpoint, timeoutInterval: 30)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        // Rate limits are per minute; one short backoff covers a burst.
         for attempt in 0..<2 {
             let started = Date()
             let (data, response) = try await URLSession.shared.data(for: request)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if status == 429 && attempt == 0 { try await Task.sleep(for: .milliseconds(700)); continue }
+            let http = response as? HTTPURLResponse
+            let status = http?.statusCode ?? 0
+            // Per-minute limits clear quickly; wait once if the server says it's short.
+            if status == 429, attempt == 0,
+               let wait = http?.value(forHTTPHeaderField: "retry-after").flatMap(Double.init), wait <= 3 {
+                try await Task.sleep(for: .seconds(wait + 0.2)); continue
+            }
             guard status == 200 else { throw Failure.http(status, String(decoding: data, as: UTF8.self)) }
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             let message = (json?["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any]

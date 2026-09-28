@@ -95,7 +95,7 @@ final class Agent {
         log("route intent=\(intent) (\(fmt(route["intent"]?.confidence))) app=\(appChoice) (\(fmt(route["app"]?.confidence)))")
 
         if intent == "ask" || intent == "other" || (route["intent"]?.confidence ?? 0) < minConfidence {
-            guard let brain else { return .failed("Add a META_API_KEY to answer questions") }
+            guard let brain else { return .failed("Add a GROQ_API_KEY to answer questions") }
             return await answer(goal, with: brain)
         }
 
@@ -437,7 +437,7 @@ final class Agent {
             return text.isEmpty ? .failed("No answer") : .answer(text)
         } catch {
             log("answer failed: \(error)")
-            return .failed("Couldn’t reach Meta AI")
+            return .failed("Couldn’t reach the Brain")
         }
     }
 
