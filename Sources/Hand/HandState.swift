@@ -32,7 +32,7 @@ final class HandState {
         speech.onLevel = { [weak self] in self?.level = $0 }
         speech.vocabulary = ["4K", "1080p", "720p", "1440p", "60fps", "30fps", "24fps", "HEVC", "H.264", "MP4",
                              "export", "Weeknd", "System Settings"] + AppCatalog.scan().map(\.name)
-        log("started: \(AppCatalog.scan().count) apps, jev \(JevClient.fromConfig() == nil ? "NOT configured" : "configured"), accessibility \(AXIsProcessTrusted()), screen recording \(ScreenVision.hasPermission)")
+        log("started: \(AppCatalog.scan().count) apps, jev \(JevClient.fromConfig() == nil ? "NOT configured" : "configured"), gemini \(Gemini.fromConfig() == nil ? "off" : "on"), accessibility \(AXIsProcessTrusted()), screen recording \(ScreenVision.hasPermission)")
     }
 
     /// Pressing the talk key also cancels whatever Hand was doing.

@@ -5,6 +5,9 @@ import AppKit
 @MainActor
 final class Agent {
     let jev: JevClient
+    /// Optional planner/writer; Hand works without it.
+    let gemini: Gemini? = Gemini.fromConfig()
+    private var plan = Gemini.Plan()
     let apps: [InstalledApp]
     let onStep: (String) -> Void
     /// Screen read taken when the talk key went down.
@@ -64,7 +67,10 @@ final class Agent {
         let appChoice = route["app"]?.choice ?? "none"
         log("route intent=\(intent) (\(fmt(route["intent"]?.confidence))) app=\(appChoice) (\(fmt(route["app"]?.confidence)))")
 
-        guard (route["intent"]?.confidence ?? 0) >= minConfidence, intent != "other" else {
+        if intent == "other" || (route["intent"]?.confidence ?? 0) < minConfidence {
+            if let gemini, let answer = try? await makePlan(gemini, goal: goal, screen: nil, history: [])?.answer, !answer.isEmpty {
+                return .done(answer)
+            }
             return .failed("I can only control the Mac for now")
         }
 
@@ -95,6 +101,7 @@ final class Agent {
         var relaunched = false
         var lastTypedIntoChat = false
         var unsureSteps = 0
+        var replanned = false
         for step in 1...maxSteps {
             try Task.checkCancellation()
             guard let app = NSWorkspace.shared.frontmostApplication else { break }
@@ -118,14 +125,24 @@ final class Agent {
                 return .failed("Can't see \(screen.appName)'s screen")
             }
 
-            let answers = try await jev.ask(state: [
+            if step == 1, let gemini {
+                onStep("Thinking…")
+                if let fresh = try? await makePlan(gemini, goal: goal, screen: screen, history: history) {
+                    plan = fresh
+                    if plan.steps.isEmpty, let answer = plan.answer, !answer.isEmpty { return .done(answer) }
+                }
+            }
+
+            var state: [String: Any] = [
                 "goal": goal,
                 "app": screen.appName,
                 "window": screen.windowTitle,
                 "steps_done": history.isEmpty ? ["nothing yet"] : history,
                 "user_was_looking_at": source.summary,
                 "screen": screen.elements.map { "\($0.id): \($0.summary)" },
-            ], questions: questions(for: screen, spans: spans))
+            ]
+            if !plan.steps.isEmpty { state["plan"] = plan.steps }
+            let answers = try await jev.ask(state: state, questions: questions(for: screen, spans: spans))
 
             let done = answers["done"]?.noul ?? 0
             // Return only makes sense right after typing; otherwise take Jev's best remaining option.
@@ -138,6 +155,13 @@ final class Agent {
             let targetConfidence = answers["target"]?.confidence ?? 0
             unsureSteps = (actionConfidence < 0.5 && targetConfidence < 0.5) ? unsureSteps + 1 : 0
             if unsureSteps >= 2 && done < doneThreshold {
+                if let gemini, !replanned {
+                    replanned = true
+                    unsureSteps = 0
+                    onStep("Rethinking…")
+                    if let fresh = try? await makePlan(gemini, goal: goal, screen: screen, history: history) { plan = fresh }
+                    continue
+                }
                 return .failed("Not sure how to do that")
             }
 
@@ -188,6 +212,9 @@ final class Agent {
                     try await Task.sleep(for: .seconds(0.4))
                     continue
                 }
+                if !Self.asksToSend(goal), element.label.range(of: #"\bsend\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                    return .failed("Won't send unless you say send")
+                }
                 onStep("Clicking \(element.label)")
                 Input.click(element)
                 history.append("Clicked \(element.summary)")
@@ -210,6 +237,7 @@ final class Agent {
         var texts: [String: Any] = [:]
         for s in spans { texts[s] = NSNull() }
         for (value, meaning) in source.typeableValues { texts[value] = meaning }
+        for text in plan.texts.prefix(5) where !text.isEmpty { texts[String(text.prefix(1000))] = "Text written for this task by the planner" }
 
         return [
             "done": [
@@ -219,7 +247,7 @@ final class Agent {
             ],
             "action": [
                 "type": "choice",
-                "instructions": "What is the single best next step toward the `goal`, given `steps_done` and what is on `screen`?",
+                "instructions": "What is the single best next step toward the `goal`, given `steps_done`, the `plan` if there is one, and what is on `screen`?",
                 "criteria": [
                     "click": "Click an item on screen: a button, list item, link, tab, sidebar entry, or search result",
                     "type": "Type or paste text into a search box, text field, title, or page that doesn't already contain it. Only when the goal asks to search for, play, find, write, add, or save something specific",
@@ -228,7 +256,7 @@ final class Agent {
             ],
             "target": [
                 "type": "choice",
-                "instructions": "Which item on `screen` should be clicked next to move toward the `goal`? Items with the same name are told apart by the section in brackets; pick the one in the section the goal names. Tags and headers name a section, they don't add to it.",
+                "instructions": "Which item on `screen` should be clicked next to move toward the `goal`? If there is a `plan`, follow its next step not yet in `steps_done`. Items with the same name are told apart by the section in brackets; pick the one in the section the goal names. Tags and headers name a section, they don't add to it.",
                 "criteria": targets,
             ],
             "field": [
@@ -238,7 +266,7 @@ final class Agent {
             ],
             "text": [
                 "type": "choice",
-                "instructions": "What should be typed to move toward the `goal`? Either words from the `goal` (leave out the app name and command words like play, open, search), or, when the goal refers to 'this', 'the link', or what the user was looking at, the matching value from `user_was_looking_at`.",
+                "instructions": "What should be typed to move toward the `goal`? Prefer text the planner wrote when the `plan` calls for typing. Otherwise words from the `goal` (leave out the app name and command words like play, open, search), or, when the goal refers to 'this', 'the link', or what the user was looking at, the matching value from `user_was_looking_at`.",
                 "criteria": texts,
             ],
         ]
@@ -288,6 +316,22 @@ final class Agent {
             try? await Task.sleep(for: .seconds(0.1))
         }
         return NSWorkspace.shared.frontmostApplication?.processIdentifier == running.processIdentifier
+    }
+
+    private func makePlan(_ gemini: Gemini, goal: String, screen: ScreenSnapshot?, history: [String]) async throws -> Gemini.Plan? {
+        let started = Date()
+        do {
+            let plan = try await gemini.plan(
+                goal: goal, app: screen?.appName ?? NSWorkspace.shared.frontmostApplication?.localizedName ?? "",
+                window: screen?.windowTitle ?? "", screen: screen?.elements.map(\.summary) ?? [],
+                lookingAt: source.summary, stepsDone: history)
+            log(String(format: "plan (%.1fs): %@ texts=%@ answer=%@", Date().timeIntervalSince(started),
+                       plan.steps.joined(separator: " → "), plan.texts.description, plan.answer ?? "-"))
+            return plan
+        } catch {
+            log("plan failed: \(error)")
+            return nil
+        }
     }
 
     /// Words that mean the user actually wants something sent.
