@@ -33,27 +33,49 @@ enum Input {
         }
     }
 
-    /// Focuses a text input, replaces its contents with `text`, and reports whether it landed.
-    @discardableResult
-    static func type(_ text: String, into element: UIElement?) async -> Bool {
+    /// Title of the window that owns the element at `point` (what a click there would land in).
+    static func windowTitle(at point: CGPoint) -> String? {
+        var element: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &element) == .success,
+              let element, let window = ScreenReader.element(element, "AXWindow") else { return nil }
+        return ScreenReader.string(window, "AXTitle")
+    }
+
+    enum TypeResult { case landed, notVerified, failed, refused }
+
+    /// Puts `text` into a field. Single-line fields (search boxes, titles) are replaced;
+    /// documents and multi-line boxes get the text inserted at the cursor, never wiped.
+    static func type(_ text: String, into element: UIElement?) async -> TypeResult {
+        let point = element?.center
+        let frontWindow = NSWorkspace.shared.frontmostApplication.flatMap { app in
+            ScreenReader.element(AXUIElementCreateApplication(app.processIdentifier), "AXFocusedWindow")
+        }
+        if let title = point.flatMap(windowTitle(at:)) ?? frontWindow.map({ ScreenReader.string($0, "AXTitle") }),
+           Redact.isSecretWindow(title) {
+            log("  refusing to type into secret window \"\(title)\"")
+            return .refused
+        }
         if let element {
             mouseClick(at: element.center)
             if let ax = element.ax { AXUIElementSetAttributeValue(ax, "AXFocused" as CFString, kCFBooleanTrue) }
             try? await Task.sleep(for: .seconds(0.25))
         }
-        key(kVK_ANSI_A, flags: .maskCommand)  // select existing text so the paste replaces it
+        let singleLine = ["AXTextField", "AXSearchField", "AXComboBox"].contains(element?.role ?? "")
+        if singleLine { key(kVK_ANSI_A, flags: .maskCommand) }  // replace a query/title, never a document
         await paste(text)
         try? await Task.sleep(for: .seconds(0.2))
 
-        guard let ax = element?.ax else { return true }  // can't read back text Hand only saw in pixels
-        if ScreenReader.string(ax, "AXValue").localizedCaseInsensitiveContains(text) { return true }
-        // Paste didn't take: try setting the value directly, then real keystrokes.
-        AXUIElementSetAttributeValue(ax, "AXValue" as CFString, text as CFString)
-        try? await Task.sleep(for: .seconds(0.15))
-        if ScreenReader.string(ax, "AXValue").localizedCaseInsensitiveContains(text) { return true }
+        guard let ax = element?.ax else { return .notVerified }  // can't read back text Hand only saw in pixels
+        if ScreenReader.string(ax, "AXValue").localizedCaseInsensitiveContains(text) { return .landed }
+        // Paste didn't take. Only single-line fields may be overwritten directly.
+        if singleLine {
+            AXUIElementSetAttributeValue(ax, "AXValue" as CFString, text as CFString)
+            try? await Task.sleep(for: .seconds(0.15))
+            if ScreenReader.string(ax, "AXValue").localizedCaseInsensitiveContains(text) { return .landed }
+        }
         typeString(text)
         try? await Task.sleep(for: .seconds(0.2))
-        return ScreenReader.string(ax, "AXValue").localizedCaseInsensitiveContains(text)
+        return ScreenReader.string(ax, "AXValue").localizedCaseInsensitiveContains(text) ? .landed : .failed
     }
 
     /// Pastes through the clipboard (web views accept this reliably), then restores the clipboard.

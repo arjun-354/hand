@@ -114,6 +114,15 @@ enum ScreenReader {
             && (attr($0, "AXMinimized") as? Bool) != true }
         if let focused { windows.removeAll { CFEqual($0, focused) }; windows.insert(focused, at: 0) }
         guard let window = windows.first else { return ("", []) }
+        // Pieces of the same window (full-screen Chrome's tab strip/toolbar) sit beside the focused
+        // window; another document behind it overlaps it and must not be read or acted on.
+        if let main = frame(of: window) {
+            windows = [window] + windows.dropFirst().filter { w in
+                guard let f = frame(of: w) else { return false }
+                let overlap = f.intersection(main)
+                return overlap.isNull || overlap.width * overlap.height < 0.1 * min(f.width * f.height, main.width * main.height)
+            }
+        }
         if Redact.isSecretWindow(string(window, "AXTitle")) { return (string(window, "AXTitle"), []) }
         let screenBounds = NSScreen.screens.map(\.frame).reduce(CGRect.null) { $0.union($1) }
         var out: [UIElement] = []

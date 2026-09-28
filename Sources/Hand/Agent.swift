@@ -217,9 +217,10 @@ final class Agent {
                 }
                 onStep("Typing \(text)")
                 lastTypedIntoChat = Self.isMessageBox(field)
-                let landed = await Input.type(text, into: field)
-                log("  typed \"\(text)\" landed=\(landed)")
-                history.append(landed
+                let result = await Input.type(text, into: field)
+                log("  typed \"\(text)\" result=\(result)")
+                if result == .refused { return .failed("Won't type into a secrets file") }
+                history.append(result != .failed
                     ? "Typed \"\(text)\" into \(field?.summary ?? "the focused field")"
                     : "Tried to type \"\(text)\" but the field stayed empty")
                 lastStep = stepKey
