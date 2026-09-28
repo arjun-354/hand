@@ -65,7 +65,8 @@ struct Gemini {
     }
 
     /// A readable answer for the notch panel: summaries, explanations, questions.
-    func answer(question: String, selectedText: String, lookingAt: [String: String], screenText: [String]) async throws -> String {
+    func answer(question: String, selectedText: String, lookingAt: [String: String], screenText: [String],
+                image: Data? = nil) async throws -> String {
         let prompt = """
         You are Hand, a voice assistant on a Mac. Answer the user's request for display in a small reading panel.
         Style: direct, no preamble. Short paragraphs or "- " bullets, **bold** for key terms, no headings, no tables.
@@ -76,19 +77,36 @@ struct Gemini {
         \(selectedText.isEmpty ? "No text is selected." : "Text they selected:\n\"\"\"\n\(selectedText.prefix(20_000))\n\"\"\"")
         \(selectedText.isEmpty && !screenText.isEmpty ? "Text visible on their screen:\n\(screenText.prefix(250).joined(separator: "\n"))" : "")
         """
-        return try await generate(prompt, json: false).trimmingCharacters(in: .whitespacesAndNewlines)
+        let withImage = image == nil ? prompt : prompt + "\nThe attached image is the window they are looking at."
+        return try await generate(withImage, json: false, image: image).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Looks at what's on screen and turns a taste call ("a song that fits this picture")
+    /// into something concrete Hand can search for or type.
+    func choose(for request: String, image: Data) async throws -> (value: String, why: String) {
+        let prompt = """
+        The attached image is what the user is looking at on their Mac. They said (speech-to-text): "\(request)"
+        Decide the one concrete thing a computer should search for or type to do this, based on what you see.
+        Be specific: for music pick one real, well-known song and write it as "Title Artist" (no dash, good for a search box);
+        for a place, the exact place name; for a caption or reply, the full text.
+        Reply with JSON only: {"value": string, "why": string (under 12 words)}
+        """
+        struct Choice: Decodable { let value: String; let why: String? }
+        let raw = try await generate(prompt, json: true, image: image)
+        let choice = try JSONDecoder().decode(Choice.self, from: Data(raw.utf8))
+        return (choice.value.trimmingCharacters(in: .whitespacesAndNewlines), choice.why ?? "")
     }
 
     // MARK: - API
 
     /// Tries models best-first. Free keys get ~20 requests per model per day, so a model
     /// that hits its daily quota is skipped until the reset; busy ones are just passed over.
-    func generate(_ prompt: String, json: Bool = true) async throws -> String {
+    func generate(_ prompt: String, json: Bool = true, image: Data? = nil) async throws -> String {
         let models = try await Self.models(apiKey: apiKey).filter { !Self.isExhausted($0) }
         var lastError: Error = Failure.noModel
-        for (i, model) in models.prefix(6).enumerated() {
+        for (i, model) in models.prefix(12).enumerated() {
             do {
-                let text = try await generate(prompt, model: model, json: json)
+                let text = try await generate(prompt, model: model, json: json, image: image)
                 if i > 0 { Self.promote(model) }  // remember what worked
                 return text
             } catch Failure.http(let code, let body) where [404, 429, 500, 503].contains(code) {
@@ -102,7 +120,12 @@ struct Gemini {
     }
 
     // Free-tier daily quotas reset at midnight Pacific time.
-    private static var exhaustedUntil: [String: Date] = [:]
+    // Remembered across launches so restarts don't spend requests rediscovering it.
+    private static var exhaustedUntil: [String: Date] = {
+        (UserDefaults.standard.dictionary(forKey: "geminiExhaustedUntil") as? [String: Date]) ?? [:]
+    }() {
+        didSet { UserDefaults.standard.set(exhaustedUntil, forKey: "geminiExhaustedUntil") }
+    }
 
     private static func isExhausted(_ model: String) -> Bool {
         guard let until = exhaustedUntil[model] else { return false }
@@ -118,17 +141,24 @@ struct Gemini {
         log("gemini \(model) used up its free daily quota; skipping until \(reset)")
     }
 
-    private static func drop(_ model: String) {
-        cachedModels?.removeAll { $0 == model }
+    /// Models this key can't use at all (retired for new users); also remembered.
+    private static var unavailable: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "geminiUnavailable") ?? []) {
+        didSet { UserDefaults.standard.set(Array(unavailable), forKey: "geminiUnavailable") }
     }
 
-    private func generate(_ prompt: String, model: String, json: Bool) async throws -> String {
+    private static func drop(_ model: String) {
+        cachedModels?.removeAll { $0 == model }
+        unavailable.insert(model)
+    }
+
+    private func generate(_ prompt: String, model: String, json: Bool, image: Data?) async throws -> String {
         var request = URLRequest(url: URL(string: "\(Self.base)/\(model):generateContent")!, timeoutInterval: 20)
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "contents": [["role": "user", "parts": [["text": prompt]]]],
+            "contents": [["role": "user", "parts": (image.map { [["inline_data": ["mime_type": "image/jpeg", "data": $0.base64EncodedString()]]] } ?? [])
+                + [["text": prompt]]]],
             "generationConfig": ["responseMimeType": json ? "application/json" : "text/plain", "temperature": 0.2],
         ])
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -163,10 +193,11 @@ struct Gemini {
                 if va != vb { return va > vb }
                 return !a.contains("preview") && b.contains("preview")  // stable over preview
             }
-        guard !names.isEmpty else { throw Failure.noModel }
-        cachedModels = names
-        log("gemini models: \(names.prefix(3).joined(separator: ", "))")
-        return names
+        let usable = names.filter { !unavailable.contains($0) }
+        guard !usable.isEmpty else { throw Failure.noModel }
+        cachedModels = usable
+        log("gemini models: \(usable.count) usable, \(exhaustedUntil.filter { $0.value > Date() }.count) out of quota today")
+        return usable
     }
 
     private static func promote(_ model: String) {

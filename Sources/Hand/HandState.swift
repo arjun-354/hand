@@ -28,6 +28,8 @@ final class HandState {
     @ObservationIgnored private var prefetch: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)?
     /// Link, title, selection and clipboard from the app in front at key-down.
     @ObservationIgnored private var source: Task<SourceContext, Never>?
+    /// Screenshot of the front window at key-down; only sent anywhere if the request is about it.
+    @ObservationIgnored private var windowImage: Task<Data?, Never>?
 
     init() {
         speech.onPartial = { [weak self] in self?.transcript = $0 }
@@ -47,6 +49,7 @@ final class HandState {
             prefetch = (front.processIdentifier, Task { await ScreenReader.snapshot(of: front) })
             let pid = front.processIdentifier, name = front.localizedName ?? ""
             source = Task.detached { SourceContext.capture(pid: pid, appName: name) }
+            windowImage = Task.detached { await ScreenVision.windowImageJPEG(pid: pid) }
         }
         task = Task {
             if !permissionsOK {
@@ -84,12 +87,18 @@ final class HandState {
         prefetch = nil
         var looking = await source?.value ?? SourceContext()
         source = nil
+        var image = windowImage
+        windowImage = nil
+        if image == nil, let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() {
+            let pid = front.processIdentifier
+            image = Task.detached { await ScreenVision.windowImageJPEG(pid: pid) }  // --say runs have no key-down
+        }
         if looking.appName.isEmpty, let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() {
             let pid = front.processIdentifier, name = front.localizedName ?? ""
             looking = await Task.detached { SourceContext.capture(pid: pid, appName: name) }.value  // --say runs have no key-down
         }
         log("looking at: \(looking.appName) \"\(looking.windowTitle)\" link=\(looking.link.isEmpty ? "-" : looking.link)")
-        let agent = Agent(jev: jev, apps: AppCatalog.scan(), prefetched: seen, source: looking) { [weak self] step in
+        let agent = Agent(jev: jev, apps: AppCatalog.scan(), prefetched: seen, source: looking, image: image) { [weak self] step in
             guard !Task.isCancelled else { return }  // a new talk press took over
             self?.phase = .working(step)
         }

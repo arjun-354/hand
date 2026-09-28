@@ -57,6 +57,46 @@ enum ScreenVision {
         }
     }
 
+    /// JPEG of `pid`'s main window, scaled to at most 1280px, for Gemini to look at.
+    /// Never for windows that look like secret files.
+    static func windowImageJPEG(pid: pid_t) async -> Data? {
+        guard hasPermission else { return nil }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+            guard let window = content.windows
+                .filter({ $0.owningApplication?.processID == pid && $0.frame.width > 100 && $0.frame.height > 100 })
+                .max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }),
+                  !Redact.isSecretWindow(window.title ?? "") else { return nil }
+            // Capture the display (reliable, 1:1 with screen points) and crop to the window.
+            guard let display = content.displays.first(where: { $0.frame.intersects(window.frame) }) ?? content.displays.first
+            else { return nil }
+            let own = content.windows.filter { $0.owningApplication?.processID == getpid() }
+            let config = SCStreamConfiguration()
+            config.width = Int(display.frame.width)
+            config.height = Int(display.frame.height)
+            config.showsCursor = false
+            var shot: CGImage?
+            for attempt in 0..<3 where shot == nil {
+                if attempt > 0 { try? await Task.sleep(for: .seconds(0.3)) }  // another capture may be running
+                shot = try? await SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(display: display, excludingWindows: own), configuration: config)
+            }
+            let crop = window.frame.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY)
+                .intersection(CGRect(origin: .zero, size: display.frame.size))
+            guard let full = shot, !crop.isNull, let image = full.cropping(to: crop) else {
+                log("window image: capture failed"); return nil
+            }
+            let data = NSMutableData()
+            guard let dest = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else { return nil }
+            CGImageDestinationAddImage(dest, image, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
+            guard CGImageDestinationFinalize(dest) else { return nil }
+            return data as Data
+        } catch {
+            log("window image error: \(error)")
+            return nil
+        }
+    }
+
     /// `area` is the on-screen rectangle (global points) the image shows.
     private static func recognize(_ image: CGImage, covering area: CGRect) throws -> [TextBox] {
         let request = VNRecognizeTextRequest()

@@ -16,6 +16,12 @@ final class Agent {
     let prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)?
     /// What was on screen when the talk key went down ("this").
     let source: SourceContext
+    /// Screenshot of that window; sent to Gemini only when the request is about it.
+    let image: Task<Data?, Never>?
+    /// What Gemini picked after looking at the image ("Holocene Bon Iver").
+    private var imageChoice: String?
+    private var looking: Task<Void, Never>?
+    private var lookFailed = false
     /// Apps already relaunched for accessibility this session; never do it twice.
     private static var relaunchedApps: Set<String> = []
 
@@ -26,7 +32,9 @@ final class Agent {
     init(jev: JevClient, apps: [InstalledApp],
          prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)? = nil,
          source: SourceContext = SourceContext(),
+         image: Task<Data?, Never>? = nil,
          onStep: @escaping (String) -> Void) {
+        self.image = image
         self.source = source
         self.jev = jev
         self.apps = apps
@@ -36,6 +44,22 @@ final class Agent {
 
     func run(_ goal: String) async throws -> Phase {
         let front = NSWorkspace.shared.frontmostApplication
+        let aboutImage = Self.refersToScreen(goal)
+        if aboutImage, let gemini, let image {
+            looking = Task {
+                guard let jpeg = await image.value else { log("no window image to look at"); self.lookFailed = true; return }
+                let started = Date()
+                do {
+                    let choice = try await gemini.choose(for: goal, image: jpeg)
+                    self.imageChoice = choice.value
+                    log(String(format: "looked at image (%.1fs, %dKB): %@ — %@", Date().timeIntervalSince(started),
+                               jpeg.count / 1024, choice.value, choice.why))
+                } catch {
+                    log("image look failed: \(error)")
+                    self.lookFailed = true
+                }
+            }
+        }
 
         // 1. Route: what kind of request, and which app.
         var appOptions: [String: Any] = [
@@ -103,6 +127,7 @@ final class Agent {
         var lastTypedIntoChat = false
         var unsureSteps = 0
         var replanned = false
+        var replanAfterResults = false
         for step in 1...maxSteps {
             try Task.checkCancellation()
             guard let app = NSWorkspace.shared.frontmostApplication else { break }
@@ -128,6 +153,18 @@ final class Agent {
 
             // Gemini plans in parallel with Jev's first look; Hand only waits for it
             // when Jev isn't confident on its own or text has to be written.
+            if step == 1, let looking {
+                onStep("Looking at the image…")
+                await looking.value
+                self.looking = nil
+                // Guessing without the picture (e.g. playing anything named "vibe") is worse than stopping.
+                if lookFailed || imageChoice == nil { return .failed("Couldn't look at the image — try again") }
+            }
+            if replanAfterResults, let gemini {
+                replanAfterResults = false
+                onStep("Reading results…")
+                if let fresh = try? await makePlan(gemini, goal: goal, screen: screen, history: history) { plan = fresh }
+            }
             if step == 1, let gemini {
                 let snapshot = screen, done = history
                 planning = Task {
@@ -144,6 +181,7 @@ final class Agent {
                 "screen": screen.elements.map { "\($0.id): \($0.summary)" },
             ]
             if !plan.steps.isEmpty { state["plan"] = plan.steps }
+            if let imageChoice { state["chosen_from_the_image"] = imageChoice }
             var answers = try await jev.ask(state: state, questions: questions(for: screen, spans: spans))
             // Wait for the plan only when Jev isn't sure of a click, or text is about to be typed
             // (the plan is what writes it). Otherwise act now and use the plan once it lands.
@@ -193,7 +231,10 @@ final class Agent {
             case "type":
                 var text = (answers["text"]?.choice ?? goal).trimmingCharacters(in: .whitespacesAndNewlines)
                 // Words lifted from the request are an echo, not a written message: use the planner's text.
-                if let written = plan.texts.first(where: { !$0.isEmpty }), spans.contains(text) {
+                if let chosen = imageChoice, spans.contains(text) || text == plan.texts.first {
+                    log("  using what Gemini picked from the image instead of \"\(text)\"")
+                    text = chosen
+                } else if let written = plan.texts.first(where: { !$0.isEmpty }), spans.contains(text) {
                     log("  using planner text instead of \"\(text)\"")
                     text = written.trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if gemini != nil, spans.contains(text), text.split(separator: " ").count >= 4 {
@@ -229,6 +270,15 @@ final class Agent {
                     ? "Typed \"\(text)\" into \(field?.summary ?? "the focused field")"
                     : "Tried to type \"\(text)\" but the field stayed empty")
                 lastStep = stepKey
+                // A search box always wants Return next; don't leave it to a guess at the suggestions list.
+                if result != .failed, let field, Self.isSearchBox(field) {
+                    try await Task.sleep(for: .seconds(0.3))
+                    Input.pressReturn()
+                    log("  pressed Return to search")
+                    history.append("Pressed Return to search")
+                    lastStep = "submit"
+                    replanAfterResults = gemini != nil  // the plan was written before results existed
+                }
 
             case "submit":
                 onStep("Pressing Return")
@@ -242,9 +292,11 @@ final class Agent {
                     return .failed("Not sure what to click")
                 }
                 let stepKey = "click:\(element.summary)"
-                // Wanting the same click again means the last one already did its job.
-                guard stepKey != lastStep else {
-                    return .done(history.last ?? "Done")
+                // Wanting the same click again usually means it already worked, but only
+                // trust that when Jev also leans toward done; otherwise it's stuck.
+                if stepKey == lastStep {
+                    if done >= 0.4 { return .done(history.last ?? "Done") }
+                    return .failed("Got stuck on \(element.label)")
                 }
                 // Screenshot positions can go stale; never click outside the app.
                 if element.ax == nil, !Self.isInside(element.center, windowsOf: app) {
@@ -282,6 +334,7 @@ final class Agent {
         var texts: [String: Any] = [:]
         for s in spans { texts[s] = NSNull() }
         for (value, meaning) in source.typeableValues { texts[value] = meaning }
+        if let imageChoice { texts[imageChoice] = "What to search for or type, chosen by looking at the user's screen" }
         for text in plan.texts.prefix(5) where !text.isEmpty { texts[String(text.prefix(1000))] = "Text written for this task by the planner" }
 
         return [
@@ -375,8 +428,10 @@ final class Agent {
         onStep("Thinking…")
         let started = Date()
         do {
+            let jpeg = Self.refersToScreen(question) ? await image?.value : nil
             let text = try await gemini.answer(question: question, selectedText: selected,
-                                               lookingAt: source.summary, screenText: screenText)
+                                               lookingAt: source.summary, screenText: jpeg == nil ? screenText : [],
+                                               image: jpeg)
             log(String(format: "answer (%.1fs, %d chars selected, %d screen items): %@", Date().timeIntervalSince(started),
                        selected.count, screenText.count, String(text.prefix(120))))
             return text.isEmpty ? .failed("No answer") : .answer(text)
@@ -392,7 +447,8 @@ final class Agent {
             let plan = try await gemini.plan(
                 goal: goal, app: screen?.appName ?? NSWorkspace.shared.frontmostApplication?.localizedName ?? "",
                 window: screen?.windowTitle ?? "", screen: screen?.elements.map(\.summary) ?? [],
-                lookingAt: source.summary, stepsDone: history)
+                lookingAt: source.summary.merging(imageChoice.map { ["chosen_from_the_image": $0] } ?? [:]) { a, _ in a },
+                stepsDone: history)
             log(String(format: "plan (%.1fs): %@ texts=%@ answer=%@", Date().timeIntervalSince(started),
                        plan.steps.joined(separator: " → "), plan.texts.description, plan.answer ?? "-"))
             return plan
@@ -400,6 +456,19 @@ final class Agent {
             if !Task.isCancelled { log("plan failed: \(error)") }
             return nil
         }
+    }
+
+    static func isSearchBox(_ element: UIElement) -> Bool {
+        if element.role == "AXSearchField" { return true }
+        let l = element.label.lowercased()
+        return ["search", "what do you want to play", "find"].contains { l.contains($0) }
+    }
+
+    /// Requests about the picture/screen itself, the only time a screenshot leaves the Mac.
+    static func refersToScreen(_ goal: String) -> Bool {
+        let g = goal.lowercased()
+        return ["image", "picture", "photo", "pic ", "screenshot", "my screen", "on screen", "on my screen",
+                "this video", "thumbnail", "this design", "vibe of this", "looks like"].contains { g.contains($0) }
     }
 
     /// Words that mean the user actually wants something sent.
