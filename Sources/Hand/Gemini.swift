@@ -81,26 +81,45 @@ struct Gemini {
 
     // MARK: - API
 
-    /// Tries the best model first and falls back when one is overloaded or rate-limited.
+    /// Tries models best-first. Free keys get ~20 requests per model per day, so a model
+    /// that hits its daily quota is skipped until the reset; busy ones are just passed over.
     func generate(_ prompt: String, json: Bool = true) async throws -> String {
-        let models = try await Self.models(apiKey: apiKey)
+        let models = try await Self.models(apiKey: apiKey).filter { !Self.isExhausted($0) }
         var lastError: Error = Failure.noModel
-        // Newest two, then the stable workhorses, which are rarely overloaded.
-        var order = Array(models.prefix(2))
-        for stable in ["models/gemini-flash-latest", "models/gemini-2.5-flash"] where models.contains(stable) && !order.contains(stable) {
-            order.append(stable)
-        }
-        for (i, model) in order.enumerated() {
+        for (i, model) in models.prefix(6).enumerated() {
             do {
                 let text = try await generate(prompt, model: model, json: json)
                 if i > 0 { Self.promote(model) }  // remember what worked
                 return text
-            } catch Failure.http(let code, let body) where [429, 500, 503].contains(code) {
-                log("gemini \(model) busy (\(code)); trying next")
+            } catch Failure.http(let code, let body) where [404, 429, 500, 503].contains(code) {
+                if code == 404 { Self.drop(model) }
+                if code == 429 && body.contains("PerDay") { Self.markExhausted(model) }
+                log("gemini \(model) unavailable (\(code)); trying next")
                 lastError = Failure.http(code, body)
             }
         }
         throw lastError
+    }
+
+    // Free-tier daily quotas reset at midnight Pacific time.
+    private static var exhaustedUntil: [String: Date] = [:]
+
+    private static func isExhausted(_ model: String) -> Bool {
+        guard let until = exhaustedUntil[model] else { return false }
+        if Date() >= until { exhaustedUntil[model] = nil; return false }
+        return true
+    }
+
+    private static func markExhausted(_ model: String) {
+        var pacific = Calendar(identifier: .gregorian)
+        pacific.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        let reset = pacific.nextDate(after: Date(), matching: DateComponents(hour: 0, minute: 5), matchingPolicy: .nextTime) ?? Date().addingTimeInterval(86_400)
+        exhaustedUntil[model] = reset
+        log("gemini \(model) used up its free daily quota; skipping until \(reset)")
+    }
+
+    private static func drop(_ model: String) {
+        cachedModels?.removeAll { $0 == model }
     }
 
     private func generate(_ prompt: String, model: String, json: Bool) async throws -> String {
@@ -133,11 +152,13 @@ struct Gemini {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else { throw Failure.http(status, String(decoding: data, as: UTF8.self)) }
         let models = ((try JSONSerialization.jsonObject(with: data) as? [String: Any])?["models"] as? [[String: Any]]) ?? []
-        let skip = ["lite", "image", "tts", "live", "audio", "embedding", "thinking", "exp", "robotics", "computer", "omni"]
+        let skip = ["image", "tts", "live", "audio", "embedding", "thinking", "exp", "robotics", "computer", "omni"]
         let names = models.filter { ($0["supportedGenerationMethods"] as? [String])?.contains("generateContent") == true }
             .compactMap { $0["name"] as? String }
             .filter { n in n.contains("flash") && !skip.contains { n.contains($0) } }
             .sorted { a, b in
+                let (la, lb) = (a.contains("lite"), b.contains("lite"))
+                if la != lb { return lb }  // full models before lite ones
                 let (va, vb) = (version(a), version(b))
                 if va != vb { return va > vb }
                 return !a.contains("preview") && b.contains("preview")  // stable over preview
