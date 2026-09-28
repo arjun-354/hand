@@ -8,6 +8,8 @@ final class Agent {
     /// Optional planner/writer; Hand works without it.
     let gemini: Gemini? = Gemini.fromConfig()
     private var plan = Gemini.Plan()
+    /// The first plan keeps running in the background after Hand starts acting.
+    private var planning: Task<Void, Never>?
     let apps: [InstalledApp]
     let onStep: (String) -> Void
     /// Screen read taken when the talk key went down.
@@ -126,10 +128,11 @@ final class Agent {
 
             // Gemini plans in parallel with Jev's first look; Hand only waits for it
             // when Jev isn't confident on its own or text has to be written.
-            var pendingPlan: Task<Gemini.Plan?, Never>?
             if step == 1, let gemini {
                 let snapshot = screen, done = history
-                pendingPlan = Task { try? await self.makePlan(gemini, goal: goal, screen: snapshot, history: done) }
+                planning = Task {
+                    if let fresh = try? await self.makePlan(gemini, goal: goal, screen: snapshot, history: done) { self.plan = fresh }
+                }
             }
 
             var state: [String: Any] = [
@@ -142,18 +145,19 @@ final class Agent {
             ]
             if !plan.steps.isEmpty { state["plan"] = plan.steps }
             var answers = try await jev.ask(state: state, questions: questions(for: screen, spans: spans))
-            if let pendingPlan {
+            // Wait for the plan only when Jev isn't sure of a click, or text is about to be typed
+            // (the plan is what writes it). Otherwise act now and use the plan once it lands.
+            if let planning, plan.steps.isEmpty {
                 let action = answers["action"]?.choice
-                let sure = action == "click" && (answers["action"]?.confidence ?? 0) >= 0.8
+                let sureClick = action == "click" && (answers["action"]?.confidence ?? 0) >= 0.8
                     && (answers["target"]?.confidence ?? 0) >= 0.8
-                if sure {
-                    log("  jev confident; not waiting for the plan")
-                    pendingPlan.cancel()
+                if sureClick {
+                    log("  jev confident; acting while the plan finishes")
                 } else {
                     onStep("Thinking…")
-                    if let fresh = await pendingPlan.value {
-                        plan = fresh
-                        if plan.steps.isEmpty, let answer = plan.answer, !answer.isEmpty { return .done(answer) }
+                    await planning.value
+                    self.planning = nil
+                    if !plan.steps.isEmpty {
                         state["plan"] = plan.steps
                         answers = try await jev.ask(state: state, questions: questions(for: screen, spans: spans))
                     }
@@ -188,6 +192,11 @@ final class Agent {
             switch action {
             case "type":
                 var text = (answers["text"]?.choice ?? goal).trimmingCharacters(in: .whitespacesAndNewlines)
+                // Words lifted from the request are an echo, not a written message: use the planner's text.
+                if let written = plan.texts.first(where: { !$0.isEmpty }), spans.contains(text) {
+                    log("  using planner text instead of \"\(text)\"")
+                    text = written.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
                 let field = answers["field"]?.choice.flatMap(screen.element)
                 if let field, let owner = Input.owner(at: field.center), owner != app.processIdentifier, owner != getpid() {
                     log("  field \(field.label) is covered by another app's window (pid \(owner)); not typing")
@@ -242,7 +251,7 @@ final class Agent {
                     return .failed("Something is covering \(screen.appName)")
                 }
                 if !Self.asksToSend(goal), element.label.range(of: #"\bsend\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
-                    return .failed("Won't send unless you say send")
+                    return .done("Draft ready — say “send” to send it")
                 }
                 onStep("Clicking \(element.label)")
                 Input.click(element)
@@ -253,6 +262,7 @@ final class Agent {
             try await Task.sleep(for: .seconds(1.0))  // let the UI settle
         }
 
+        planning?.cancel()
         return .failed("Ran out of steps")
     }
 
