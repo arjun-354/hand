@@ -62,8 +62,7 @@ enum Input {
         }
         let singleLine = ["AXTextField", "AXSearchField", "AXComboBox"].contains(element?.role ?? "")
         if singleLine { key(kVK_ANSI_A, flags: .maskCommand) }  // replace a query/title, never a document
-        await paste(text)
-        try? await Task.sleep(for: .seconds(0.2))
+        await paste(text, into: element?.ax)
 
         guard let ax = element?.ax else { return .notVerified }  // can't read back text Hand only saw in pixels
         if ScreenReader.string(ax, "AXValue").localizedCaseInsensitiveContains(text) { return .landed }
@@ -79,7 +78,10 @@ enum Input {
     }
 
     /// Pastes through the clipboard (web views accept this reliably), then restores the clipboard.
-    static func paste(_ text: String) async {
+    /// The app handles ⌘V whenever it gets to it, so the old clipboard only comes back once the
+    /// text has visibly landed (or after a long wait). Restoring too early once pasted the user's
+    /// previous clipboard (an API key) into a document instead of Hand's text.
+    static func paste(_ text: String, into ax: AXUIElement? = nil) async {
         let board = NSPasteboard.general
         let saved = board.pasteboardItems?.map { item in
             item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
@@ -87,7 +89,12 @@ enum Input {
         board.clearContents()
         board.setString(text, forType: .string)
         key(kVK_ANSI_V, flags: .maskCommand)
-        try? await Task.sleep(for: .seconds(0.3))
+        let probe = String(text.prefix(40))
+        for _ in 0..<20 {  // up to 2s
+            try? await Task.sleep(for: .seconds(0.1))
+            if let ax, ScreenReader.string(ax, "AXValue").contains(probe) { break }
+        }
+        try? await Task.sleep(for: .seconds(0.2))  // let the paste finish past the first characters
         board.clearContents()
         let restored = saved.map { pairs -> NSPasteboardItem in
             let item = NSPasteboardItem()

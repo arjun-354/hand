@@ -128,6 +128,7 @@ final class Agent {
         var unsureSteps = 0
         var replanned = false
         var replanAfterResults = false
+        var wroteText = false  // written (not searched) text is in; typing again would duplicate it
         for step in 1...maxSteps {
             try Task.checkCancellation()
             guard let app = NSWorkspace.shared.frontmostApplication else { break }
@@ -248,6 +249,10 @@ final class Agent {
                     log("  field \(field.label) is covered by another app's window (pid \(owner)); not typing")
                     return .failed("Something is covering \(screen.appName)")
                 }
+                if wroteText, !(field.map(Self.isSearchBox) ?? false) {
+                    log("  already wrote the text; not typing it again")
+                    return .done(history.last ?? "Done")
+                }
                 if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
                     return .failed("\(screen.appName) lost focus; stopped")
                 }
@@ -270,6 +275,9 @@ final class Agent {
                     ? "Typed \"\(text)\" into \(field?.summary ?? "the focused field")"
                     : "Tried to type \"\(text)\" but the field stayed empty")
                 lastStep = stepKey
+                if result != .failed, !(field.map(Self.isSearchBox) ?? false), text.split(separator: " ").count >= 4 {
+                    wroteText = true
+                }
                 // A search box always wants Return next; don't leave it to a guess at the suggestions list.
                 if result != .failed, let field, Self.isSearchBox(field) {
                     try await Task.sleep(for: .seconds(0.3))
