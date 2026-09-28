@@ -4,6 +4,8 @@ A voice agent that lives in the MacBook notch and controls the whole Mac. Hold *
 
 Decisions are made by [TypeSafe's Jev](https://docs.typesafe.ai), a System One model that returns typed choices with calibrated confidence instead of generated text — about 0.2s and a fraction of a cent per step.
 
+An optional **Brain** ([Meta Model API](https://dev.meta.ai/docs/overview), `muse-spark-1.3`) plans multi-step tasks, writes text, answers questions in a reading panel, and looks at the screen when a request is about an image. Jev still makes every per-step decision.
+
 ## How it works
 
 1. **Listen** — push-to-talk, Apple on-device speech recognition (`SpeechListener`).
@@ -21,6 +23,8 @@ The notch UI (`NotchView`, `NotchWindow`) drops out of the camera housing and sh
 # 1. TypeSafe key (never commit it)
 mkdir -p ~/.config/hand && echo 'TYPESAFE_API_KEY=your_key' > ~/.config/hand/.env && chmod 600 ~/.config/hand/.env
 scripts/test-jev.sh
+# Optional: Meta key for planning/writing/answers (META_MODEL overrides the model)
+echo 'META_API_KEY=your_key' >> ~/.config/hand/.env && scripts/test-brain.sh
 
 # 2. Build and run
 scripts/build-app.sh --run

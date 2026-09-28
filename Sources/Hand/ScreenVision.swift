@@ -57,7 +57,7 @@ enum ScreenVision {
         }
     }
 
-    /// JPEG of `pid`'s main window, scaled to at most 1280px, for Gemini to look at.
+    /// JPEG of `pid`'s main window, scaled to at most 1280px, for Brain to look at.
     /// Never for windows that look like secret files.
     static func windowImageJPEG(pid: pid_t) async -> Data? {
         guard hasPermission else { return nil }

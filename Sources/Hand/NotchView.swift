@@ -104,7 +104,7 @@ struct NotchView: View {
     }
 }
 
-/// Reading view for Gemini answers: scrollable, selectable, stays until closed.
+/// Reading view for Brain answers: scrollable, selectable, stays until closed.
 private struct AnswerPanel: View {
     let question: String
     let text: String
@@ -151,7 +151,7 @@ private struct AnswerPanel: View {
         }
     }
 
-    /// Bold, italics and links from Gemini's markdown; keeps its line breaks and bullets.
+    /// Bold, italics and links from Brain's markdown; keeps its line breaks and bullets.
     static func render(_ text: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         let bulleted = text.replacingOccurrences(of: #"(?m)^\s*[-*] "#, with: "•  ", options: .regularExpression)

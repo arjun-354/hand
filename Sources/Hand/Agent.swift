@@ -6,8 +6,8 @@ import AppKit
 final class Agent {
     let jev: JevClient
     /// Optional planner/writer; Hand works without it.
-    let gemini: Gemini? = Gemini.fromConfig()
-    private var plan = Gemini.Plan()
+    let brain: Brain? = Brain.fromConfig()
+    private var plan = Brain.Plan()
     /// The first plan keeps running in the background after Hand starts acting.
     private var planning: Task<Void, Never>?
     let apps: [InstalledApp]
@@ -16,9 +16,9 @@ final class Agent {
     let prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)?
     /// What was on screen when the talk key went down ("this").
     let source: SourceContext
-    /// Screenshot of that window; sent to Gemini only when the request is about it.
+    /// Screenshot of that window; sent to Brain only when the request is about it.
     let image: Task<Data?, Never>?
-    /// What Gemini picked after looking at the image ("Holocene Bon Iver").
+    /// What Brain picked after looking at the image ("Holocene Bon Iver").
     private var imageChoice: String?
     private var looking: Task<Void, Never>?
     private var lookFailed = false
@@ -45,12 +45,12 @@ final class Agent {
     func run(_ goal: String) async throws -> Phase {
         let front = NSWorkspace.shared.frontmostApplication
         let aboutImage = Self.refersToScreen(goal)
-        if aboutImage, let gemini, let image {
+        if aboutImage, let brain, let image {
             looking = Task {
                 guard let jpeg = await image.value else { log("no window image to look at"); self.lookFailed = true; return }
                 let started = Date()
                 do {
-                    let choice = try await gemini.choose(for: goal, image: jpeg)
+                    let choice = try await brain.choose(for: goal, image: jpeg)
                     self.imageChoice = choice.value
                     log(String(format: "looked at image (%.1fs, %dKB): %@ — %@", Date().timeIntervalSince(started),
                                jpeg.count / 1024, choice.value, choice.why))
@@ -95,8 +95,8 @@ final class Agent {
         log("route intent=\(intent) (\(fmt(route["intent"]?.confidence))) app=\(appChoice) (\(fmt(route["app"]?.confidence)))")
 
         if intent == "ask" || intent == "other" || (route["intent"]?.confidence ?? 0) < minConfidence {
-            guard let gemini else { return .failed("Add a Gemini key to answer questions") }
-            return await answer(goal, with: gemini)
+            guard let brain else { return .failed("Add a META_API_KEY to answer questions") }
+            return await answer(goal, with: brain)
         }
 
         let target = apps.first { $0.name == appChoice }
@@ -151,7 +151,7 @@ final class Agent {
                 return .failed("Can't see \(screen.appName)'s screen")
             }
 
-            // Gemini plans in parallel with Jev's first look; Hand only waits for it
+            // Brain plans in parallel with Jev's first look; Hand only waits for it
             // when Jev isn't confident on its own or text has to be written.
             if step == 1, let looking {
                 onStep("Looking at the image…")
@@ -160,15 +160,15 @@ final class Agent {
                 // Guessing without the picture (e.g. playing anything named "vibe") is worse than stopping.
                 if lookFailed || imageChoice == nil { return .failed("Couldn't look at the image — try again") }
             }
-            if replanAfterResults, let gemini {
+            if replanAfterResults, let brain {
                 replanAfterResults = false
                 onStep("Reading results…")
-                if let fresh = try? await makePlan(gemini, goal: goal, screen: screen, history: history) { plan = fresh }
+                if let fresh = try? await makePlan(brain, goal: goal, screen: screen, history: history) { plan = fresh }
             }
-            if step == 1, let gemini {
+            if step == 1, let brain {
                 let snapshot = screen, done = history
                 planning = Task {
-                    if let fresh = try? await self.makePlan(gemini, goal: goal, screen: snapshot, history: done) { self.plan = fresh }
+                    if let fresh = try? await self.makePlan(brain, goal: goal, screen: snapshot, history: done) { self.plan = fresh }
                 }
             }
 
@@ -213,11 +213,11 @@ final class Agent {
             let targetConfidence = answers["target"]?.confidence ?? 0
             unsureSteps = (actionConfidence < 0.5 && targetConfidence < 0.5) ? unsureSteps + 1 : 0
             if unsureSteps >= 2 && done < doneThreshold {
-                if let gemini, !replanned {
+                if let brain, !replanned {
                     replanned = true
                     unsureSteps = 0
                     onStep("Rethinking…")
-                    if let fresh = try? await makePlan(gemini, goal: goal, screen: screen, history: history) { plan = fresh }
+                    if let fresh = try? await makePlan(brain, goal: goal, screen: screen, history: history) { plan = fresh }
                     continue
                 }
                 return .failed("Not sure how to do that")
@@ -232,16 +232,16 @@ final class Agent {
                 var text = (answers["text"]?.choice ?? goal).trimmingCharacters(in: .whitespacesAndNewlines)
                 // Words lifted from the request are an echo, not a written message: use the planner's text.
                 if let chosen = imageChoice, spans.contains(text) || text == plan.texts.first {
-                    log("  using what Gemini picked from the image instead of \"\(text)\"")
+                    log("  using what Brain picked from the image instead of \"\(text)\"")
                     text = chosen
                 } else if let written = plan.texts.first(where: { !$0.isEmpty }), spans.contains(text) {
                     log("  using planner text instead of \"\(text)\"")
                     text = written.trimmingCharacters(in: .whitespacesAndNewlines)
-                } else if gemini != nil, spans.contains(text), text.split(separator: " ").count >= 4 {
+                } else if brain != nil, spans.contains(text), text.split(separator: " ").count >= 4 {
                     // A long chunk of the request is a writing job, and the writer didn't answer.
                     // Typing the command itself would be wrong, so stop.
                     log("  no planner text for \"\(text)\"; not echoing the request")
-                    return .failed("Gemini is busy — try again in a moment")
+                    return .failed("Couldn’t write that — try again")
                 }
                 let field = answers["field"]?.choice.flatMap(screen.element)
                 if let field, let owner = Input.owner(at: field.center), owner != app.processIdentifier, owner != getpid() {
@@ -277,7 +277,7 @@ final class Agent {
                     log("  pressed Return to search")
                     history.append("Pressed Return to search")
                     lastStep = "submit"
-                    replanAfterResults = gemini != nil  // the plan was written before results existed
+                    replanAfterResults = brain != nil  // the plan was written before results existed
                 }
 
             case "submit":
@@ -416,7 +416,7 @@ final class Agent {
         return NSWorkspace.shared.frontmostApplication?.processIdentifier == running.processIdentifier
     }
 
-    private func answer(_ question: String, with gemini: Gemini) async -> Phase {
+    private func answer(_ question: String, with brain: Brain) async -> Phase {
         onStep("Reading…")
         var selected = source.selectedText
         let secret = Redact.isSecretWindow(source.windowTitle)
@@ -429,7 +429,7 @@ final class Agent {
         let started = Date()
         do {
             let jpeg = Self.refersToScreen(question) ? await image?.value : nil
-            let text = try await gemini.answer(question: question, selectedText: selected,
+            let text = try await brain.answer(question: question, selectedText: selected,
                                                lookingAt: source.summary, screenText: jpeg == nil ? screenText : [],
                                                image: jpeg)
             log(String(format: "answer (%.1fs, %d chars selected, %d screen items): %@", Date().timeIntervalSince(started),
@@ -437,14 +437,14 @@ final class Agent {
             return text.isEmpty ? .failed("No answer") : .answer(text)
         } catch {
             log("answer failed: \(error)")
-            return .failed("Couldn't reach Gemini")
+            return .failed("Couldn’t reach Meta AI")
         }
     }
 
-    private func makePlan(_ gemini: Gemini, goal: String, screen: ScreenSnapshot?, history: [String]) async throws -> Gemini.Plan? {
+    private func makePlan(_ brain: Brain, goal: String, screen: ScreenSnapshot?, history: [String]) async throws -> Brain.Plan? {
         let started = Date()
         do {
-            let plan = try await gemini.plan(
+            let plan = try await brain.plan(
                 goal: goal, app: screen?.appName ?? NSWorkspace.shared.frontmostApplication?.localizedName ?? "",
                 window: screen?.windowTitle ?? "", screen: screen?.elements.map(\.summary) ?? [],
                 lookingAt: source.summary.merging(imageChoice.map { ["chosen_from_the_image": $0] } ?? [:]) { a, _ in a },

@@ -33,7 +33,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestAccessibilityIfNeeded()
         if !ScreenVision.hasPermission { ScreenVision.requestPermission() }
         ScreenVision.warmUp()
-        Gemini.fromConfig()?.warmUp()
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
