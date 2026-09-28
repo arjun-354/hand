@@ -22,8 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey = HotkeyMonitor(
             key: .rightOption,
             // Called synchronously on the main thread so press and release can never run out of order.
-            onPress: { [state] in MainActor.assumeIsolated { state.startListening() } },
-            onRelease: { [state] in MainActor.assumeIsolated { state.stopListening() } }
+            // Main-queue blocks run in order (press before release) without MainActor.assumeIsolated,
+            // whose executor check crashed inside the Swift runtime on a key press.
+            onPress: { [state] in DispatchQueue.main.async { state.startListening() } },
+            onRelease: { [state] in DispatchQueue.main.async { state.stopListening() } }
         )
         hotkey?.start()
 

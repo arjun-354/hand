@@ -24,6 +24,8 @@ struct NotchGeometry {
 final class NotchPanel: NSPanel {
     static let canvas = NSSize(width: 620, height: 460)
     private let state: HandState
+    /// True while an answer is showing; read by canBecomeKey without touching the actor.
+    private var interactive = false
 
     init(state: HandState) {
         self.state = state
@@ -58,6 +60,7 @@ final class NotchPanel: NSPanel {
                 guard let self else { return }
                 let answering: Bool = { if case .answer = self.state.phase { return true }; return false }()
                 self.ignoresMouseEvents = !answering
+                self.interactive = answering
                 // While interactive, the window is exactly the panel, so it can't swallow clicks around it.
                 let screen = Self.targetScreen()
                 if case .answer(let text) = self.state.phase {
@@ -76,12 +79,11 @@ final class NotchPanel: NSPanel {
 
     /// Esc closes an answer.
     override func cancelOperation(_ sender: Any?) {
-        MainActor.assumeIsolated { state.dismiss() }
+        DispatchQueue.main.async { [state] in state.dismiss() }
     }
 
     override var canBecomeKey: Bool {
-        if case .answer = MainActor.assumeIsolated({ state.phase }) { return true }
-        return false
+        interactive
     }
     override var canBecomeMain: Bool { false }
 
