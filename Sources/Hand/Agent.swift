@@ -53,7 +53,8 @@ final class Agent {
                         "open_app": "Only open, launch, or switch to an application — nothing else",
                         "quit_app": "Quit or close an application",
                         "operate": "Do something inside an application: search, play, click, navigate to a page or setting, type, send, etc.",
-                        "other": "A question or chit-chat that doesn't ask the computer to do anything",
+                        "ask": "Asks a question, or wants something summarized, explained, translated, or read out from the screen or the selected text — answered in words, no clicking",
+                        "other": "Chit-chat that doesn't ask the computer to do anything",
                     ],
                 ],
                 "app": [
@@ -67,11 +68,9 @@ final class Agent {
         let appChoice = route["app"]?.choice ?? "none"
         log("route intent=\(intent) (\(fmt(route["intent"]?.confidence))) app=\(appChoice) (\(fmt(route["app"]?.confidence)))")
 
-        if intent == "other" || (route["intent"]?.confidence ?? 0) < minConfidence {
-            if let gemini, let answer = try? await makePlan(gemini, goal: goal, screen: nil, history: [])?.answer, !answer.isEmpty {
-                return .done(answer)
-            }
-            return .failed("I can only control the Mac for now")
+        if intent == "ask" || intent == "other" || (route["intent"]?.confidence ?? 0) < minConfidence {
+            guard let gemini else { return .failed("Add a Gemini key to answer questions") }
+            return await answer(goal, with: gemini)
         }
 
         let target = apps.first { $0.name == appChoice }
@@ -346,6 +345,29 @@ final class Agent {
             try? await Task.sleep(for: .seconds(0.1))
         }
         return NSWorkspace.shared.frontmostApplication?.processIdentifier == running.processIdentifier
+    }
+
+    private func answer(_ question: String, with gemini: Gemini) async -> Phase {
+        onStep("Reading…")
+        var selected = source.selectedText
+        let secret = Redact.isSecretWindow(source.windowTitle)
+        if selected.isEmpty, !secret, NSWorkspace.shared.frontmostApplication?.processIdentifier != getpid() {
+            selected = Redact.secrets(await Input.copySelection())
+        }
+        var screenText: [String] = []
+        if selected.isEmpty, !secret, let prefetched { screenText = await prefetched.snapshot.value.elements.map(\.label) }
+        onStep("Thinking…")
+        let started = Date()
+        do {
+            let text = try await gemini.answer(question: question, selectedText: selected,
+                                               lookingAt: source.summary, screenText: screenText)
+            log(String(format: "answer (%.1fs, %d chars selected, %d screen items): %@", Date().timeIntervalSince(started),
+                       selected.count, screenText.count, String(text.prefix(120))))
+            return text.isEmpty ? .failed("No answer") : .answer(text)
+        } catch {
+            log("answer failed: \(error)")
+            return .failed("Couldn't reach Gemini")
+        }
     }
 
     private func makePlan(_ gemini: Gemini, goal: String, screen: ScreenSnapshot?, history: [String]) async throws -> Gemini.Plan? {

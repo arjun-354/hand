@@ -8,6 +8,8 @@ enum Phase: Equatable {
     case working(String)
     case done(String)
     case failed(String)
+    /// A readable answer that stays open until dismissed.
+    case answer(String)
 }
 
 @MainActor
@@ -108,11 +110,18 @@ final class HandState {
 
     func finish(_ result: Phase) {
         phase = result
+        if case .answer = result { return }  // stays until the user closes it
         task = Task {
             try? await Task.sleep(for: .seconds(2.5))
             guard !Task.isCancelled else { return }
             phase = .idle
         }
+    }
+
+    /// Closes an answer panel (close button, Esc, or the next talk press).
+    func dismiss() {
+        task?.cancel()
+        phase = .idle
     }
 
     /// Animation-only walkthrough; doesn't touch the mic or run anything.

@@ -64,15 +64,30 @@ struct Gemini {
         return try JSONDecoder().decode(Plan.self, from: Data(raw.utf8))
     }
 
+    /// A readable answer for the notch panel: summaries, explanations, questions.
+    func answer(question: String, selectedText: String, lookingAt: [String: String], screenText: [String]) async throws -> String {
+        let prompt = """
+        You are Hand, a voice assistant on a Mac. Answer the user's request for display in a small reading panel.
+        Style: direct, no preamble. Short paragraphs or "- " bullets, **bold** for key terms, no headings, no tables.
+        Keep it under 180 words unless the user asked for detail.
+
+        User said (speech-to-text, may be misheard): "\(question)"
+        App and page they're on: \(lookingAt.isEmpty ? "unknown" : "\(lookingAt)")
+        \(selectedText.isEmpty ? "No text is selected." : "Text they selected:\n\"\"\"\n\(selectedText.prefix(20_000))\n\"\"\"")
+        \(selectedText.isEmpty && !screenText.isEmpty ? "Text visible on their screen:\n\(screenText.prefix(250).joined(separator: "\n"))" : "")
+        """
+        return try await generate(prompt, json: false).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: - API
 
     /// Tries the best model first and falls back when one is overloaded or rate-limited.
-    func generate(_ prompt: String) async throws -> String {
+    func generate(_ prompt: String, json: Bool = true) async throws -> String {
         let models = try await Self.models(apiKey: apiKey)
         var lastError: Error = Failure.noModel
         for (i, model) in models.prefix(3).enumerated() {
             do {
-                let text = try await generate(prompt, model: model)
+                let text = try await generate(prompt, model: model, json: json)
                 if i > 0 { Self.promote(model) }  // remember what worked
                 return text
             } catch Failure.http(let code, let body) where [429, 500, 503].contains(code) {
@@ -83,14 +98,14 @@ struct Gemini {
         throw lastError
     }
 
-    private func generate(_ prompt: String, model: String) async throws -> String {
+    private func generate(_ prompt: String, model: String, json: Bool) async throws -> String {
         var request = URLRequest(url: URL(string: "\(Self.base)/\(model):generateContent")!, timeoutInterval: 20)
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "contents": [["role": "user", "parts": [["text": prompt]]]],
-            "generationConfig": ["responseMimeType": "application/json", "temperature": 0.2],
+            "generationConfig": ["responseMimeType": json ? "application/json" : "text/plain", "temperature": 0.2],
         ])
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0

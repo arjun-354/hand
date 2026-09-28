@@ -75,6 +75,27 @@ enum Input {
         if !restored.isEmpty { board.writeObjects(restored) }
     }
 
+    /// Copies the front app's selection with ⌘C and returns it, restoring the clipboard.
+    /// For apps (web pages, PDFs) that don't report their selection to Accessibility.
+    static func copySelection() async -> String {
+        let board = NSPasteboard.general
+        let saved = board.pasteboardItems?.map { item in
+            item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
+        } ?? []
+        let before = board.changeCount
+        key(kVK_ANSI_C, flags: .maskCommand)
+        for _ in 0..<10 where board.changeCount == before { try? await Task.sleep(for: .seconds(0.05)) }
+        let copied = board.changeCount == before ? "" : (board.string(forType: .string) ?? "")
+        board.clearContents()
+        let restored = saved.map { pairs -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in pairs { item.setData(data, forType: type) }
+            return item
+        }
+        if !restored.isEmpty { board.writeObjects(restored) }
+        return copied
+    }
+
     static func typeString(_ text: String) {
         let src = CGEventSource(stateID: .hidSystemState)
         for chunk in text.chunked(into: 16) {

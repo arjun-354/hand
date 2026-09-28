@@ -22,9 +22,11 @@ struct NotchGeometry {
 /// Transparent, click-through panel pinned over the notch. The panel itself
 /// never moves; the SwiftUI shape inside it grows out of the notch.
 final class NotchPanel: NSPanel {
-    static let canvas = NSSize(width: 560, height: 240)
+    static let canvas = NSSize(width: 620, height: 460)
+    private let state: HandState
 
     init(state: HandState) {
+        self.state = state
         super.init(
             contentRect: NSRect(origin: .zero, size: Self.canvas),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -44,9 +46,43 @@ final class NotchPanel: NSPanel {
         host.frame = NSRect(origin: .zero, size: Self.canvas)
         contentView = host
         place(on: screen)
+        followPhase()
     }
 
-    override var canBecomeKey: Bool { false }
+    /// Answers are interactive (scroll, select, copy, close); everything else is click-through.
+    private func followPhase() {
+        withObservationTracking {
+            _ = state.phase
+        } onChange: { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let answering: Bool = { if case .answer = self.state.phase { return true }; return false }()
+                self.ignoresMouseEvents = !answering
+                // While interactive, the window is exactly the panel, so it can't swallow clicks around it.
+                let screen = Self.targetScreen()
+                if case .answer(let text) = self.state.phase {
+                    let size = NSSize(width: NotchView.answerWidth + 24,
+                                      height: NotchGeometry.of(screen).height + NotchView.answerHeight(text) + 6)
+                    self.setFrame(NSRect(x: screen.frame.midX - size.width / 2, y: screen.frame.maxY - size.height,
+                                         width: size.width, height: size.height), display: true)
+                } else if self.frame.size != Self.canvas {
+                    self.place(on: screen)
+                }
+                if answering { self.makeKeyAndOrderFront(nil) } else if self.isKeyWindow { self.resignKey() }
+                self.followPhase()
+            }
+        }
+    }
+
+    /// Esc closes an answer.
+    override func cancelOperation(_ sender: Any?) {
+        MainActor.assumeIsolated { state.dismiss() }
+    }
+
+    override var canBecomeKey: Bool {
+        if case .answer = MainActor.assumeIsolated({ state.phase }) { return true }
+        return false
+    }
     override var canBecomeMain: Bool { false }
 
     // Borderless windows get pushed below the menu bar by default; keep ours flush with the top edge.
