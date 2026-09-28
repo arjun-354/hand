@@ -196,6 +196,11 @@ final class Agent {
                 if let written = plan.texts.first(where: { !$0.isEmpty }), spans.contains(text) {
                     log("  using planner text instead of \"\(text)\"")
                     text = written.trimmingCharacters(in: .whitespacesAndNewlines)
+                } else if gemini != nil, spans.contains(text), text.split(separator: " ").count >= 4 {
+                    // A long chunk of the request is a writing job, and the writer didn't answer.
+                    // Typing the command itself would be wrong, so stop.
+                    log("  no planner text for \"\(text)\"; not echoing the request")
+                    return .failed("Gemini is busy — try again in a moment")
                 }
                 let field = answers["field"]?.choice.flatMap(screen.element)
                 if let field, let owner = Input.owner(at: field.center), owner != app.processIdentifier, owner != getpid() {

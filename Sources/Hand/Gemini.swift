@@ -85,7 +85,12 @@ struct Gemini {
     func generate(_ prompt: String, json: Bool = true) async throws -> String {
         let models = try await Self.models(apiKey: apiKey)
         var lastError: Error = Failure.noModel
-        for (i, model) in models.prefix(3).enumerated() {
+        // Newest two, then the stable workhorses, which are rarely overloaded.
+        var order = Array(models.prefix(2))
+        for stable in ["models/gemini-flash-latest", "models/gemini-2.5-flash"] where models.contains(stable) && !order.contains(stable) {
+            order.append(stable)
+        }
+        for (i, model) in order.enumerated() {
             do {
                 let text = try await generate(prompt, model: model, json: json)
                 if i > 0 { Self.promote(model) }  // remember what worked
