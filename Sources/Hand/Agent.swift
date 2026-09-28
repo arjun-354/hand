@@ -125,12 +125,12 @@ final class Agent {
                 return .failed("Can't see \(screen.appName)'s screen")
             }
 
+            // Gemini plans in parallel with Jev's first look; Hand only waits for it
+            // when Jev isn't confident on its own or text has to be written.
+            var pendingPlan: Task<Gemini.Plan?, Never>?
             if step == 1, let gemini {
-                onStep("Thinking…")
-                if let fresh = try? await makePlan(gemini, goal: goal, screen: screen, history: history) {
-                    plan = fresh
-                    if plan.steps.isEmpty, let answer = plan.answer, !answer.isEmpty { return .done(answer) }
-                }
+                let snapshot = screen, done = history
+                pendingPlan = Task { try? await self.makePlan(gemini, goal: goal, screen: snapshot, history: done) }
             }
 
             var state: [String: Any] = [
@@ -142,7 +142,24 @@ final class Agent {
                 "screen": screen.elements.map { "\($0.id): \($0.summary)" },
             ]
             if !plan.steps.isEmpty { state["plan"] = plan.steps }
-            let answers = try await jev.ask(state: state, questions: questions(for: screen, spans: spans))
+            var answers = try await jev.ask(state: state, questions: questions(for: screen, spans: spans))
+            if let pendingPlan {
+                let action = answers["action"]?.choice
+                let sure = action == "click" && (answers["action"]?.confidence ?? 0) >= 0.8
+                    && (answers["target"]?.confidence ?? 0) >= 0.8
+                if sure {
+                    log("  jev confident; not waiting for the plan")
+                    pendingPlan.cancel()
+                } else {
+                    onStep("Thinking…")
+                    if let fresh = await pendingPlan.value {
+                        plan = fresh
+                        if plan.steps.isEmpty, let answer = plan.answer, !answer.isEmpty { return .done(answer) }
+                        state["plan"] = plan.steps
+                        answers = try await jev.ask(state: state, questions: questions(for: screen, spans: spans))
+                    }
+                }
+            }
 
             let done = answers["done"]?.noul ?? 0
             // Return only makes sense right after typing; otherwise take Jev's best remaining option.
@@ -171,8 +188,17 @@ final class Agent {
 
             switch action {
             case "type":
-                let text = answers["text"]?.choice ?? goal
+                var text = (answers["text"]?.choice ?? goal).trimmingCharacters(in: .whitespacesAndNewlines)
                 let field = answers["field"]?.choice.flatMap(screen.element)
+                if let field, let owner = Input.owner(at: field.center), owner != app.processIdentifier, owner != getpid() {
+                    log("  field \(field.label) is covered by another app's window (pid \(owner)); not typing")
+                    return .failed("Something is covering \(screen.appName)")
+                }
+                if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
+                    return .failed("\(screen.appName) lost focus; stopped")
+                }
+                // In a chat box, Return sends: a line break in pasted text would send it.
+                if Self.isMessageBox(field) && !Self.asksToSend(goal) { text = text.replacingOccurrences(of: "\n", with: " ") }
                 let stepKey = "type:\(text)"
                 if stepKey == lastStep {  // already typed it; submit instead of retyping
                     onStep("Pressing Return")
@@ -211,6 +237,10 @@ final class Agent {
                     log("  \(element.label) @\(Int(element.center.x)),\(Int(element.center.y)) is outside \(screen.appName)'s windows; looking again")
                     try await Task.sleep(for: .seconds(0.4))
                     continue
+                }
+                if let owner = Input.owner(at: element.center), owner != app.processIdentifier, owner != getpid() {
+                    log("  \(element.label) is covered by another app's window (pid \(owner)); not clicking")
+                    return .failed("Something is covering \(screen.appName)")
                 }
                 if !Self.asksToSend(goal), element.label.range(of: #"\bsend\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
                     return .failed("Won't send unless you say send")
@@ -329,7 +359,7 @@ final class Agent {
                        plan.steps.joined(separator: " → "), plan.texts.description, plan.answer ?? "-"))
             return plan
         } catch {
-            log("plan failed: \(error)")
+            if !Task.isCancelled { log("plan failed: \(error)") }
             return nil
         }
     }
@@ -343,7 +373,6 @@ final class Agent {
     /// Text areas and fields that look like a chat composer, where Return sends.
     static func isMessageBox(_ element: UIElement?) -> Bool {
         guard let element else { return false }
-        if element.role == "AXTextArea" { return true }
         let l = element.label.lowercased()
         return ["message", "reply", "chat", "write", "ask", "compose", "prompt", "type a", "how can i help"].contains { l.contains($0) }
     }

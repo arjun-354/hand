@@ -114,6 +114,7 @@ enum ScreenReader {
             && (attr($0, "AXMinimized") as? Bool) != true }
         if let focused { windows.removeAll { CFEqual($0, focused) }; windows.insert(focused, at: 0) }
         guard let window = windows.first else { return ("", []) }
+        if Redact.isSecretWindow(string(window, "AXTitle")) { return (string(window, "AXTitle"), []) }
         let screenBounds = NSScreen.screens.map(\.frame).reduce(CGRect.null) { $0.union($1) }
         var out: [UIElement] = []
         var headings: [(label: String, frame: CGRect)] = []
@@ -171,7 +172,7 @@ enum ScreenReader {
                     && (e.label.localizedCaseInsensitiveContains(box.text) || box.text.localizedCaseInsensitiveContains(e.label))
             }
             if !covered {
-                all.append(UIElement(id: "", role: visibleTextRole, label: box.text,
+                all.append(UIElement(id: "", role: visibleTextRole, label: Redact.secrets(box.text),
                                      frame: box.frame, ax: nil, canPress: false))
             }
         }
@@ -284,7 +285,7 @@ enum ScreenReader {
             let texts = descendantTexts(e, limit: 3)
             if !texts.isEmpty { label = ([label] + texts).filter { !$0.isEmpty }.joined(separator: " — ") }
         }
-        return String(label.prefix(120))
+        return Redact.secrets(String(label.prefix(120)))
     }
 
     nonisolated private static func descendantTexts(_ e: AXUIElement, limit: Int, depth: Int = 0) -> [String] {

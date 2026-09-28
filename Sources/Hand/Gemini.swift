@@ -6,7 +6,7 @@ struct Gemini {
     let apiKey: String
     private static let base = "https://generativelanguage.googleapis.com/v1beta"
     /// Chosen once per launch from the models this key can use (or GEMINI_MODEL).
-    private static var cachedModel: String?
+    private static var cachedModels: [String]?
 
     struct Plan: Decodable {
         var steps: [String] = []
@@ -30,6 +30,9 @@ struct Gemini {
     static func fromConfig() -> Gemini? {
         Config.value("GEMINI_API_KEY").map { Gemini(apiKey: $0) }
     }
+
+    /// Looks up the model list at launch so the first plan doesn't pay for it.
+    func warmUp() { Task { _ = try? await Self.models(apiKey: apiKey) } }
 
     // MARK: - What Hand asks
 
@@ -63,8 +66,24 @@ struct Gemini {
 
     // MARK: - API
 
+    /// Tries the best model first and falls back when one is overloaded or rate-limited.
     func generate(_ prompt: String) async throws -> String {
-        let model = try await Self.model(apiKey: apiKey)
+        let models = try await Self.models(apiKey: apiKey)
+        var lastError: Error = Failure.noModel
+        for (i, model) in models.prefix(3).enumerated() {
+            do {
+                let text = try await generate(prompt, model: model)
+                if i > 0 { Self.promote(model) }  // remember what worked
+                return text
+            } catch Failure.http(let code, let body) where [429, 500, 503].contains(code) {
+                log("gemini \(model) busy (\(code)); trying next")
+                lastError = Failure.http(code, body)
+            }
+        }
+        throw lastError
+    }
+
+    private func generate(_ prompt: String, model: String) async throws -> String {
         var request = URLRequest(url: URL(string: "\(Self.base)/\(model):generateContent")!, timeoutInterval: 20)
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
@@ -84,29 +103,37 @@ struct Gemini {
         return text
     }
 
-    /// Picks the newest general-purpose Flash model this key can call.
-    private static func model(apiKey: String) async throws -> String {
-        if let override = Config.value("GEMINI_MODEL") { return override.hasPrefix("models/") ? override : "models/\(override)" }
-        if let cachedModel { return cachedModel }
+    /// General-purpose Flash models this key can call, newest first (or GEMINI_MODEL alone).
+    private static func models(apiKey: String) async throws -> [String] {
+        if let override = Config.value("GEMINI_MODEL") { return [override.hasPrefix("models/") ? override : "models/\(override)"] }
+        if let cachedModels { return cachedModels }
         var request = URLRequest(url: URL(string: "\(base)/models?pageSize=200")!, timeoutInterval: 10)
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else { throw Failure.http(status, String(decoding: data, as: UTF8.self)) }
         let models = ((try JSONSerialization.jsonObject(with: data) as? [String: Any])?["models"] as? [[String: Any]]) ?? []
-        let skip = ["lite", "image", "tts", "live", "audio", "embedding", "thinking", "exp", "robotics", "computer"]
+        let skip = ["lite", "image", "tts", "live", "audio", "embedding", "thinking", "exp", "robotics", "computer", "omni"]
         let names = models.filter { ($0["supportedGenerationMethods"] as? [String])?.contains("generateContent") == true }
             .compactMap { $0["name"] as? String }
             .filter { n in n.contains("flash") && !skip.contains { n.contains($0) } }
-        // Highest version first, stable over preview.
-        guard let best = names.sorted(by: { a, b in
-            let (va, vb) = (version(a), version(b))
-            if va != vb { return va > vb }
-            return !a.contains("preview") && b.contains("preview")
-        }).first else { throw Failure.noModel }
-        cachedModel = best
-        log("gemini model: \(best)")
-        return best
+            .sorted { a, b in
+                let (va, vb) = (version(a), version(b))
+                if va != vb { return va > vb }
+                return !a.contains("preview") && b.contains("preview")  // stable over preview
+            }
+        guard !names.isEmpty else { throw Failure.noModel }
+        cachedModels = names
+        log("gemini models: \(names.prefix(3).joined(separator: ", "))")
+        return names
+    }
+
+    private static func promote(_ model: String) {
+        guard var list = cachedModels, let i = list.firstIndex(of: model) else { return }
+        list.remove(at: i)
+        list.insert(model, at: 0)
+        cachedModels = list
+        log("gemini model now: \(model)")
     }
 
     private static func version(_ name: String) -> Double {

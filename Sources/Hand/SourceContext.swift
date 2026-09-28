@@ -30,17 +30,18 @@ struct SourceContext {
     /// Safe to call off the main thread.
     static func capture(pid: pid_t, appName: String) -> SourceContext {
         var ctx = SourceContext(appName: appName)
-        ctx.clipboard = NSPasteboard.general.string(forType: .string)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        ctx.clipboard = Redact.secrets(NSPasteboard.general.string(forType: .string)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
 
         let root = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(root, 0.5)
         if let focused = ScreenReader.element(root, "AXFocusedUIElement") {
-            ctx.selectedText = ScreenReader.string(focused, "AXSelectedText")
+            ctx.selectedText = Redact.secrets(ScreenReader.string(focused, "AXSelectedText"))
         }
         guard let window = ScreenReader.element(root, "AXFocusedWindow") ?? ScreenReader.element(root, "AXMainWindow")
         else { return ctx }
         ctx.windowTitle = ScreenReader.string(window, "AXTitle")
+        if Redact.isSecretWindow(ctx.windowTitle) { ctx.selectedText = ""; return ctx }
         ctx.link = findLink(in: window)
         return ctx
     }

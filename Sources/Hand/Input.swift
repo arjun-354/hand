@@ -15,6 +15,15 @@ enum Input {
         mouseClick(at: element.center)
     }
 
+    /// The app whose window is actually at `point` (what a click there would hit).
+    static func owner(at point: CGPoint) -> pid_t? {
+        var element: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &element) == .success,
+              let element else { return nil }
+        var pid: pid_t = 0
+        return AXUIElementGetPid(element, &pid) == .success ? pid : nil
+    }
+
     static func mouseClick(at point: CGPoint) {
         let src = CGEventSource(stateID: .hidSystemState)
         for type in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
