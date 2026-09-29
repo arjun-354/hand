@@ -79,6 +79,7 @@ final class Agent {
                         "open_app": "Only open, launch, or switch to an application — nothing else",
                         "quit_app": "Quit or close an application",
                         "operate": "Do something inside an application: search, play, click, navigate to a page or setting, type, send, etc.",
+                        "slack": "Asks about their Slack: messages someone sent, DMs, mentions, what they missed, or what was said in a channel",
                         "ask": "Asks a question, or wants something summarized, explained, translated, or read out from the screen or the selected text — answered in words, no clicking",
                         "other": "Chit-chat that doesn't ask the computer to do anything",
                     ],
@@ -94,6 +95,10 @@ final class Agent {
         let appChoice = route["app"]?.choice ?? "none"
         log("route intent=\(intent) (\(fmt(route["intent"]?.confidence))) app=\(appChoice) (\(fmt(route["app"]?.confidence)))")
 
+        if intent == "slack" {
+            guard let brain else { return .failed("Add a GROQ_API_KEY to read Slack") }
+            return await readSlack(goal, with: brain)
+        }
         if intent == "ask" || intent == "other" || (route["intent"]?.confidence ?? 0) < minConfidence {
             guard let brain else { return .failed("Add a GROQ_API_KEY to answer questions") }
             return await answer(goal, with: brain)
@@ -422,6 +427,45 @@ final class Agent {
             try? await Task.sleep(for: .seconds(0.1))
         }
         return NSWorkspace.shared.frontmostApplication?.processIdentifier == running.processIdentifier
+    }
+
+    private func readSlack(_ question: String, with brain: Brain) async -> Phase {
+        guard let slack = Slack.fromKeychain() else { return .failed("Connect Slack first: scripts/slack-token.sh") }
+        let started = Date()
+        do {
+            onStep("Checking Slack…")
+            let lookup = try await brain.slackLookup(for: question)
+            var messages: [Slack.Message]
+            switch lookup.kind {
+            case "dms":
+                messages = try await slack.recentDMs(hours: Double(lookup.days) * 24)
+                if !lookup.person.isEmpty {
+                    let who = lookup.person.lowercased()
+                    messages = messages.filter { $0.author.lowercased().contains(who) || $0.channel.lowercased().contains(who) }
+                }
+            case "mentions":
+                messages = try await slack.mentions(days: lookup.days)
+            default:
+                var query = [lookup.words, "after:\(Slack.day(daysAgo: lookup.days + 1))"]
+                if !lookup.channel.isEmpty { query.append("in:#\(lookup.channel)") }
+                if !lookup.person.isEmpty {
+                    guard let id = try await slack.person(named: lookup.person) else {
+                        return .failed("Couldn't find \(lookup.person) on Slack")
+                    }
+                    query.append("from:<@\(id)>")
+                }
+                messages = try await slack.search(query.filter { !$0.isEmpty }.joined(separator: " "))
+            }
+            log(String(format: "slack %@ words=%@ person=%@ channel=%@ days=%d -> %d messages (%.1fs)", lookup.kind,
+                       lookup.words, lookup.person, lookup.channel, lookup.days, messages.count, Date().timeIntervalSince(started)))
+            onStep("Reading \(messages.count) messages…")
+            let text = try await brain.summarize(question: question, source: "Slack", messages: messages.map(\.line))
+            log(String(format: "slack answer ready in %.1fs", Date().timeIntervalSince(started)))
+            return .answer(text)
+        } catch {
+            log("slack failed: \(error)")
+            return .failed("\(error)")
+        }
     }
 
     private func answer(_ question: String, with brain: Brain) async -> Phase {

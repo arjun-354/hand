@@ -130,6 +130,57 @@ struct Brain {
         return (choice.value.trimmingCharacters(in: .whitespacesAndNewlines), choice.why ?? "")
     }
 
+    struct SlackLookup: Decodable {
+        /// "search" (keywords/person/channel), "dms" (recent direct messages), "mentions" (where I'm @-mentioned)
+        var kind: String = "search"
+        var words: String = ""
+        var person: String = ""
+        var channel: String = ""
+        var days: Int = 2
+
+        enum CodingKeys: CodingKey { case kind, words, person, channel, days }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            kind = (try? c.decode(String.self, forKey: .kind)) ?? "search"
+            words = (try? c.decode(String.self, forKey: .words)) ?? ""
+            person = (try? c.decode(String.self, forKey: .person)) ?? ""
+            channel = ((try? c.decode(String.self, forKey: .channel)) ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+            days = min(max((try? c.decode(Int.self, forKey: .days)) ?? 2, 1), 30)
+        }
+    }
+
+    /// Turns "what did Ritesh ask me yesterday on Slack" into a concrete lookup.
+    func slackLookup(for request: String) async throws -> SlackLookup {
+        let prompt = """
+        Turn this request about the user's Slack into a lookup. Today is \(Date().formatted(date: .complete, time: .omitted)).
+        Request (speech-to-text, names may be misspelled): "\(request)"
+        kind: "dms" for their direct messages / what people sent them / unread or missed messages,
+              "mentions" for where they were @-mentioned or tagged,
+              "search" for a topic, a specific person's messages, or a channel.
+        words: search keywords only (no names, no dates), or "".
+        person: the other person's name if one is mentioned, or "".
+        channel: channel name without #, or "".
+        days: how far back to look (today = 1, yesterday = 2, this week = 7). Default 2.
+        Reply with JSON only: {"kind": string, "words": string, "person": string, "channel": string, "days": number}
+        """
+        let raw = try await generate(prompt)
+        return try JSONDecoder().decode(SlackLookup.self, from: Data(raw.utf8))
+    }
+
+    /// Answers a question from a set of messages (Slack now, email later).
+    func summarize(question: String, source: String, messages: [String]) async throws -> String {
+        let prompt = """
+        You are Hand, a voice assistant on a Mac. Answer the user's question using only these \(source) messages.
+        Style: direct, no preamble. Short "- " bullets, **bold** names and asks, no headings. Under 150 words.
+        Point out anything that needs a reply from the user. If nothing relevant is in the messages, say so plainly.
+
+        Question: "\(question)"
+        Messages (newest first):
+        \(messages.prefix(60).joined(separator: "\n"))
+        """
+        return try await generate(prompt, json: false).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: - API
 
     /// One chat completion on the first model that isn't rate-limited.
