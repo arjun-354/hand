@@ -6,13 +6,16 @@ import Carbon.HIToolbox
 @MainActor
 enum Input {
     /// Presses an element: AXPress when the element supports it, a real click otherwise.
-    static func click(_ element: UIElement) {
+    /// Returns true when it used AXPress (some web apps accept the action but ignore it).
+    @discardableResult
+    static func click(_ element: UIElement, forceMouse: Bool = false) -> Bool {
         let rowLike = ["AXRow", "AXCell", "AXOutlineRow"].contains(element.role)
-        if element.canPress, !rowLike, let ax = element.ax,
+        if !forceMouse, element.canPress, !rowLike, let ax = element.ax,
            AXUIElementPerformAction(ax, "AXPress" as CFString) == .success {
-            return
+            return true
         }
         mouseClick(at: element.center)
+        return false
     }
 
     /// The app whose window is actually at `point` (what a click there would hit).
@@ -22,6 +25,13 @@ enum Input {
               let element else { return nil }
         var pid: pid_t = 0
         return AXUIElementGetPid(element, &pid) == .success ? pid : nil
+    }
+
+    /// Moves the real pointer over a point, for UIs that only show controls on hover
+    /// (Notion's "Open" button on a database row).
+    static func hover(at point: CGPoint) {
+        CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState), mouseType: .mouseMoved,
+                mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
     }
 
     static func mouseClick(at point: CGPoint) {

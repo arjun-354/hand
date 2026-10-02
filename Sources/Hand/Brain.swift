@@ -89,6 +89,9 @@ struct Brain {
         - Put any text that must be typed (message body, title, file name, search query) in "texts", exactly as it should appear.
           If the user asked to paste something they were looking at, use that exact value.
         - Never plan sending, deleting, buying or posting unless the user explicitly asked for it.
+        - Act on the specific item: to play a search result click the Play button that names it ("Play <title>"),
+          never the player's generic Play button; to open a database row use its "Open" button, not its title text.
+        - If a step says a click "changed nothing", plan a different way (hover-revealed buttons, the item's menu, double-click).
         - If the request is a question that needs no action on the computer, leave steps empty and put a one-sentence answer in "answer".
 
         Reply with JSON only: {"steps": [string], "texts": [string], "answer": string or null}
@@ -116,16 +119,25 @@ struct Brain {
 
     /// Looks at what's on screen and turns a taste call ("a song that fits this picture")
     /// into something concrete Hand can search for or type.
+    /// Two stages: the vision model only describes the picture (it invents songs), then the
+    /// stronger text model makes the pick from that description.
     func choose(for request: String, image: Data) async throws -> (value: String, why: String) {
+        let description = try await generate("""
+        Describe this image for someone choosing something that fits it (music, a caption, a place).
+        Cover: setting, mood, colors, time of day, era/style, any visible text. 2-3 sentences, plain text.
+        """, json: false, image: image)
+        log("image description: \(description.prefix(200))")
         let prompt = """
-        The attached image is what the user is looking at on their Mac. They said (speech-to-text): "\(request)"
-        Decide the one concrete thing a computer should search for or type to do this, based on what you see.
-        Be specific: for music pick one real, well-known song and write it as "Title Artist" (no dash, good for a search box);
-        for a place, the exact place name; for a caption or reply, the full text.
+        The user is looking at an image described as: "\(description)"
+        They said (speech-to-text): "\(request)"
+        Decide the one concrete thing a computer should search for or type to do this.
+        For music: one real, well-known song that certainly exists on Spotify, written as "Title Artist" (no dash).
+        Never invent songs or artists; if unsure, pick a famous track that fits the mood.
+        For a place: the exact place name. For a caption or reply: the full text.
         Reply with JSON only: {"value": string, "why": string (under 12 words)}
         """
         struct Choice: Decodable { let value: String; let why: String? }
-        let raw = try await generate(prompt, json: true, image: image)
+        let raw = try await generate(prompt, json: true)
         let choice = try JSONDecoder().decode(Choice.self, from: Data(raw.utf8))
         return (choice.value.trimmingCharacters(in: .whitespacesAndNewlines), choice.why ?? "")
     }

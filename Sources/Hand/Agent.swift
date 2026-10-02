@@ -27,7 +27,7 @@ final class Agent {
 
     let maxSteps = 8
     let minConfidence = 0.25
-    let doneThreshold = 0.6
+    let doneThreshold = 0.55
 
     init(jev: JevClient, apps: [InstalledApp],
          prefetched: (pid: pid_t, snapshot: Task<ScreenSnapshot, Never>)? = nil,
@@ -44,6 +44,9 @@ final class Agent {
 
     func run(_ goal: String) async throws -> Phase {
         let front = NSWorkspace.shared.frontmostApplication
+        if ["com.apple.loginwindow", "com.apple.ScreenSaver.Engine"].contains(front?.bundleIdentifier ?? "") {
+            return .failed("Your Mac is locked")
+        }
         let aboutImage = Self.refersToScreen(goal)
         if aboutImage, let brain, let image {
             looking = Task {
@@ -105,13 +108,14 @@ final class Agent {
         }
 
         let target = apps.first { $0.name == appChoice }
+        let appSure = (route["app"]?.confidence ?? 0) >= 0.5
 
         switch intent {
         case "quit_app":
-            guard let target else { return .failed("Which app?") }
+            guard let target, appSure else { return .failed("Which app?") }
             return await Actions.run(.quit(target))
         case "open_app":
-            guard let target else { return .failed("Which app?") }
+            guard let target, appSure else { return .failed("Which app?") }
             return await Actions.run(.open(target))
         default:
             break
@@ -133,6 +137,11 @@ final class Agent {
         var unsureSteps = 0
         var replanned = false
         var replanAfterResults = false
+        var lastClick: (element: UIElement, before: (title: String, labels: Set<String>), pressed: Bool)?  // to notice clicks that did nothing
+        var hovered = Set<String>()
+        var beforeHover: Set<String>?
+        var failedSpot: CGPoint?                // where a click just did nothing
+        var revealedControls: [UIElement] = []  // what hovering there uncovered  // labels before a hover, to report what it revealed
         var wroteText = false  // written (not searched) text is in; typing again would duplicate it
         for step in 1...maxSteps {
             try Task.checkCancellation()
@@ -148,6 +157,59 @@ final class Agent {
                let fresh = NSWorkspace.shared.frontmostApplication {
                 relaunched = true
                 screen = await ScreenReader.snapshot(of: fresh)
+            }
+            if let before = beforeHover {
+                beforeHover = nil
+                let found = Self.revealed(by: before, in: screen, goal: goal)
+                history.append(found.text)
+                revealedControls = found.best
+                log("  \(history[history.count - 1])")
+            }
+            var clickDidNothing = false
+            if let click = lastClick {
+                lastClick = nil
+                // Clicking a title can turn it into a rename box instead of opening it.
+                let core = String(click.element.label.drop { !$0.isLetter }.prefix(18))
+                let enteredEdit = !core.isEmpty && screen.elements.contains {
+                    $0.isTextInput && $0.label.contains(core) && !click.before.labels.contains($0.summary)
+                }
+                if enteredEdit {
+                    log("  click opened a rename box; pressing Esc")
+                    Input.pressEscape()
+                    try await Task.sleep(for: .seconds(0.4))
+                    screen = await ScreenReader.snapshot(of: app)
+                }
+                // An accessibility "press" that visibly did nothing: try a real mouse click once.
+                if click.pressed, !enteredEdit, !screen.changedMeaningfully(since: click.before) {
+                    log("  press did nothing; clicking \(click.element.label) with the mouse")
+                    Input.click(click.element, forceMouse: true)
+                    try await Task.sleep(for: .seconds(1.0))
+                    screen = await ScreenReader.snapshot(of: app)
+                    if screen.changedMeaningfully(since: click.before) {
+                        history[history.count - 1] += " (needed a real mouse click)"
+                    }
+                }
+                if enteredEdit || !screen.changedMeaningfully(since: click.before) {
+                    clickDidNothing = true
+                    failedSpot = click.element.center
+                    let key = click.element.label
+                    history.append(enteredEdit
+                        ? "Clicking \(click.element.summary) only started renaming it (cancelled with Esc)"
+                        : "Clicking \(click.element.summary) changed nothing on screen")
+                    // Some apps only show the real control (Notion's "Open") while the pointer
+                    // is over a row. Hover once and look again so it shows up.
+                    if !hovered.contains(key) {
+                        hovered.insert(key)
+                        let before = screen.fingerprint.labels
+                        Input.hover(at: click.element.center)
+                        try await Task.sleep(for: .seconds(0.5))
+                        screen = await ScreenReader.snapshot(of: app)
+                        let found = Self.revealed(by: before, in: screen, goal: goal)
+                        history[history.count - 1] += "; " + found.text
+                        revealedControls = found.best
+                        log("  click changed nothing; hovered: \(history[history.count - 1])")
+                    }
+                }
             }
             log("step \(step): \(screen.appName) \"\(screen.windowTitle)\" \(screen.elements.count) elements")
             dumpScreen(screen)
@@ -229,7 +291,7 @@ final class Agent {
                 return .failed("Not sure how to do that")
             }
 
-            if done >= doneThreshold {
+            if done >= doneThreshold && !clickDidNothing {
                 return .done(history.last ?? "Done")
             }
 
@@ -300,16 +362,32 @@ final class Agent {
                 lastStep = "submit"
 
             default:
-                guard let id = answers["target"]?.choice, let element = screen.element(id),
+                guard let id = answers["target"]?.choice, var element = screen.element(id),
                       (answers["target"]?.confidence ?? 0) >= minConfidence else {
                     return .failed("Not sure what to click")
                 }
-                let stepKey = "click:\(element.summary)"
+                // Don't go back to the spot that just did nothing when hovering uncovered something.
+                if let spot = failedSpot, abs(element.center.x - spot.x) < 12, abs(element.center.y - spot.y) < 12,
+                   let better = revealedControls.first(where: { r in screen.elements.contains { $0.summary == r.summary } }) {
+                    log("  \(element.label) just did nothing; using revealed \(better.label) instead")
+                    element = screen.elements.first { $0.summary == better.summary } ?? better
+                    revealedControls.removeAll { $0.summary == better.summary }
+                }
+                let stepKey = "click:\(element.summary)@\(Int(element.center.x / 10)),\(Int(element.center.y / 10))"
                 // Wanting the same click again usually means it already worked, but only
                 // trust that when Jev also leans toward done; otherwise it's stuck.
+                // Asking for the exact same click again: if the last one visibly worked, the job is
+                // done; if it did nothing, repeating it won't help — reveal hover controls instead.
                 if stepKey == lastStep {
-                    if done >= 0.4 { return .done(history.last ?? "Done") }
-                    return .failed("Got stuck on \(element.label)")
+                    if !clickDidNothing && done >= 0.4 { return .done(history.last ?? "Done") }
+                    if hovered.contains(element.label) { return .failed("Got stuck on \(element.label)") }
+                    hovered.insert(element.label)
+                    beforeHover = screen.fingerprint.labels
+                    Input.hover(at: element.center)
+                    history.append("Clicking \(element.summary) again won't help; hovered over it to reveal its buttons")
+                    log("  repeat click on \(element.label); hovering instead")
+                    try await Task.sleep(for: .seconds(0.5))
+                    continue
                 }
                 // Screenshot positions can go stale; never click outside the app.
                 if element.ax == nil, !Self.isInside(element.center, windowsOf: app) {
@@ -321,11 +399,17 @@ final class Agent {
                     log("  \(element.label) is covered by another app's window (pid \(owner)); not clicking")
                     return .failed("Something is covering \(screen.appName)")
                 }
+                if Self.isRisky(element.label), !Self.asksFor(element.label, in: goal) {
+                    log("  refusing \(element.label): destructive and not asked for")
+                    return .failed("Won't \(element.label.lowercased()) unless you ask")
+                }
                 if !Self.asksToSend(goal), element.label.range(of: #"\bsend\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
                     return .done("Draft ready — say “send” to send it")
                 }
                 onStep("Clicking \(element.label)")
-                Input.click(element)
+                let before = screen.fingerprint
+                let pressed = Input.click(element)
+                lastClick = (element, before, pressed)
                 history.append("Clicked \(element.summary)")
                 lastStep = stepKey
             }
@@ -353,8 +437,9 @@ final class Agent {
         return [
             "done": [
                 "type": "noul",
-                // Picked by testing phrasings against recorded screens; separates done/not-done best.
-                "instructions": "Does the `window` title or the last entry of `steps_done` show that the `goal` has been achieved?",
+                // Judged on the screen, not on step wording: "Clicked Open…" fooled the old phrasing
+                // while Notion only went into rename mode. Re-tested on Settings, Spotify and Notion screens.
+                "instructions": "Look at what is on `screen` now. Does it show the `goal` has been achieved (the requested page, panel, item or result is visibly open or happening)? A step in `steps_done` only counts if its result is visible on `screen`.",
             ],
             "action": [
                 "type": "choice",
@@ -367,7 +452,7 @@ final class Agent {
             ],
             "target": [
                 "type": "choice",
-                "instructions": "Which item on `screen` should be clicked next to move toward the `goal`? If there is a `plan`, follow its next step not yet in `steps_done`. Items with the same name are told apart by the section in brackets; pick the one in the section the goal names. Tags and headers name a section, they don't add to it.",
+                "instructions": "Which item on `screen` should be clicked next to move toward the `goal`? If there is a `plan`, follow its next step not yet in `steps_done`. Items with the same name are told apart by the section in brackets; pick the one in the section the goal names. Tags and headers name a section, they don't add to it. Prefer a control that names the specific item (\"Play Desert King\", \"Open\" on that row) over a generic one (the player's Play button). If `steps_done` says a click changed nothing, choose something else.",
                 "criteria": targets,
             ],
             "field": [
@@ -521,6 +606,40 @@ final class Agent {
         let g = goal.lowercased()
         return ["image", "picture", "photo", "pic ", "screenshot", "my screen", "on screen", "on my screen",
                 "this video", "thumbnail", "this design", "vibe of this", "looks like"].contains { g.contains($0) }
+    }
+
+    /// "hovering revealed: Open in side peek" — so Jev knows the new control is there.
+    static func revealed(by before: Set<String>, in screen: ScreenSnapshot, goal: String) -> (text: String, best: [UIElement]) {
+        let oldLabels = before.map { $0.components(separatedBy: ": ").dropFirst().joined(separator: ": ") }
+        let goalWords = Set(goal.lowercased().split { !$0.isLetter }.map(String.init).filter { $0.count > 2 })
+        // Names that start with a word from the request rank first ("Open in side peek" for "open …").
+        let score = { (e: UIElement) -> Int in
+            let l = e.label.lowercased()
+            return goalWords.filter { l.contains($0) }.count + (goalWords.contains { l.hasPrefix($0) } ? 2 : 0)
+        }
+        // Only plain buttons/links: menus and drag handles lead into menus full of edits.
+        let new = screen.elements
+            .filter { e in e.ax != nil && !before.contains(e.summary) && !oldLabels.contains { $0.hasPrefix(e.label) } }
+            .filter { ["AXButton", "AXLink"].contains($0.role) && !Self.isRisky($0.label) }
+            .filter { !$0.label.lowercased().contains("drag") && !$0.label.lowercased().contains("menu") }
+            .sorted { score($0) > score($1) }
+        guard !new.isEmpty else { return ("hovering revealed nothing new", []) }
+        let list = new.prefix(4).map { "\($0.id) \(UIElement.friendly($0.role)) \"\($0.label.prefix(40))\"" }
+        return ("hovering revealed: " + list.joined(separator: ", ") + " — use one of these next", Array(new.prefix(4)))
+    }
+
+    private static let riskyWords = ["delete", "remove", "trash", "archive", "duplicate", "move to", "discard", "erase", "clear all"]
+
+    /// Controls that destroy or reshuffle content.
+    static func isRisky(_ label: String) -> Bool {
+        let l = label.lowercased()
+        return riskyWords.contains { l.hasPrefix($0) || l.contains(" \($0)") }
+    }
+
+    /// The user said the risky word themselves ("delete this page").
+    static func asksFor(_ label: String, in goal: String) -> Bool {
+        let g = goal.lowercased(), l = label.lowercased()
+        return riskyWords.contains { l.contains($0) && g.contains($0.components(separatedBy: " ")[0]) }
     }
 
     /// Words that mean the user actually wants something sent.

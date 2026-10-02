@@ -51,6 +51,18 @@ struct ScreenSnapshot {
     let elements: [UIElement]
 
     func element(_ id: String) -> UIElement? { elements.first { $0.id == id } }
+
+    /// What's visible, for telling whether a click actually did something.
+    var fingerprint: (title: String, labels: Set<String>) {
+        (windowTitle, Set(elements.map(\.summary)))
+    }
+
+    /// A real change: new window title, or several new things appearing (a page, panel,
+    /// menu or results). Things disappearing doesn't count: hover buttons vanish on their own.
+    func changedMeaningfully(since before: (title: String, labels: Set<String>)) -> Bool {
+        let now = fingerprint
+        return now.title != before.title || now.labels.subtracting(before.labels).count >= 3
+    }
 }
 
 /// Reads the front window of an app through the Accessibility API and flattens
@@ -162,7 +174,7 @@ enum ScreenReader {
             bounds = frame(of: w) ?? .infinite
             walk(w, depth: 0)
         }
-        return (string(window, "AXTitle"), addContext(to: pruneDuplicates(out), headings: headings))
+        return (string(window, "AXTitle"), addContext(to: untangleLabels(pruneDuplicates(out)), headings: headings))
     }
 
     /// Adds screenshot text that Accessibility didn't already cover, then numbers everything.
@@ -204,6 +216,22 @@ enum ScreenReader {
             }
         }
         return kept
+    }
+
+    /// Some apps label a row's title with a neighbouring control's name glued on
+    /// (Notion: title = "Open in side peek 📲 Guide…", next to the real "Open in side peek"
+    /// button). Strip the borrowed name so the real control is the only one that says it.
+    nonisolated private static func untangleLabels(_ elements: [UIElement]) -> [UIElement] {
+        elements.map { e in
+            guard let other = elements.first(where: { o in
+                o.id != e.id && o.label.count >= 6 && e.label.hasPrefix(o.label + " ")
+                    && abs(o.center.y - e.center.y) < 10
+            }) else { return e }
+            var copy = e
+            copy = UIElement(id: e.id, role: e.role, label: String(e.label.dropFirst(other.label.count + 1)),
+                             frame: e.frame, ax: e.ax, canPress: e.canPress, context: e.context)
+            return copy
+        }
     }
 
     /// Boards and lists repeat the same controls ("New page" in every column).
